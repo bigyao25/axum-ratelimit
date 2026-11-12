@@ -1,0 +1,145 @@
+name: Axum Performance Benchmarks
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        description: Comparison, operational smoke, or in-process microbenchmarks
+        options: [compare, smoke, micro]
+        default: compare
+      full_matrix:
+        type: boolean
+        description: All nine client-count/mode combinations
+        default: false
+      duration:
+        type: string
+        description: Seconds per sample (1-120)
+        default: '10'
+      repeats:
+        type: string
+        description: Independent repetitions (1-10)
+        default: '3'
+permissions:
+  contents: read
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python3 -W error::ResourceWarning -m unittest discover -s benchmarks/tests -v
+      - name: Verify committed lockfiles
+        run: |
+          test -f Cargo.lock
+          test -f benchmarks/Cargo.lock
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path benchmarks/Cargo.toml
+
+  benchmark:
+    if: inputs.suite != 'micro'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        backend: [memory, redis]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks -> target
+      - name: Build native Axum comparison server
+        run: |
+          sudo apt-get update && sudo apt-get install -y wrk
+          cargo build --locked --release --manifest-path benchmarks/Cargo.toml
+          mkdir -p benchmarks/docker-bin
+          cp benchmarks/target/release/axum-ratelimit-benchmark benchmarks/docker-bin/benchmark-server
+          docker build -f benchmarks/Dockerfile -t axum-ratelimit-benchmark:local .
+      - name: Run independent resource-bounded measurements
+        env:
+          SUITE: ${{ inputs.suite }}
+          FULL_MATRIX: ${{ inputs.full_matrix }}
+          DURATION: ${{ inputs.duration }}
+          REPEATS: ${{ inputs.repeats }}
+          BACKEND: ${{ matrix.backend }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmarks/results/ci
+          options=()
+          if [ "$FULL_MATRIX" = true ]; then options+=(--full-matrix); fi
+          python3 benchmarks/harness.py --backend "$BACKEND" --suite "$SUITE" \
+            --duration "$DURATION" --repeats "$REPEATS" "${options[@]}" \
+            --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+      - name: Publish assessment without hiding failures
+        if: always()
+        shell: bash
+        run: |
+          if [ -f benchmarks/results/ci/assessment.md ]; then
+            cat benchmarks/results/ci/assessment.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Benchmark did not produce measurements. Inspect build/run logs; no performance conclusion is available.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-diagnostics-${{ matrix.backend }}
+          path: benchmarks/results/ci/
+          if-no-files-found: warn
+          retention-days: 14
+
+  micro:
+    if: inputs.suite == 'micro'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run memory and middleware microbenchmarks explicitly
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmarks/results/micro
+          cargo bench --locked --no-default-features --bench memory 2>&1 | tee benchmarks/results/micro/memory.log
+          cargo bench --locked --no-default-features --bench middleware 2>&1 | tee benchmarks/results/micro/middleware.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-micro
+          path: benchmarks/results/micro/
+
+  overview:
+    if: ${{ always() && needs.prepare.result == 'success' && inputs.suite != 'micro' }}
+    needs: [prepare, benchmark]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: benchmark-diagnostics-*
+          path: benchmarks/results/shards
+      - name: Collect backend reports without averaging unlike workloads
+        run: python3 benchmarks/overview.py benchmarks/results/shards
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-overview
+          path: benchmarks/results/overview.md

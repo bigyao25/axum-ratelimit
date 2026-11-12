@@ -1,0 +1,11 @@
+/target/
+/benchmarks/target/
+/benchmarks/results/*
+!/benchmarks/results/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
+.env
+*.log
+
+benchmarks/docker-bin/

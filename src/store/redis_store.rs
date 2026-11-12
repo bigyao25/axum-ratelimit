@@ -1,0 +1,285 @@
+use crate::{
+    config::RateLimitConfig,
+    observability::ObservedRateLimitDecision,
+    store::{RateLimitDecision, RateLimitMetadata, RateLimitStore, StoreError},
+};
+use futures_util::future::BoxFuture;
+use redis::{
+    Client, RedisError, RedisResult, Script,
+    aio::{ConnectionManager, ConnectionManagerConfig},
+};
+use std::{io, sync::LazyLock, time::Duration};
+
+static SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("sliding_window.lua")));
+
+/// Runtime Redis failure handling. Startup connection failures always return an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FailurePolicy {
+    /// Preserve availability by admitting requests when Redis is unavailable.
+    #[default]
+    FailOpen,
+    /// Return an error; the middleware responds with HTTP 503.
+    FailClosed,
+}
+
+#[derive(Debug, Clone)]
+pub struct RedisStoreOptions {
+    /// Total deadline for initialization or a check, including reconnect waits.
+    pub timeout: Duration,
+    pub failure_policy: FailurePolicy,
+}
+
+impl Default for RedisStoreOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(1),
+            failure_policy: FailurePolicy::FailOpen,
+        }
+    }
+}
+
+/// Atomic distributed sliding windows using server time and a shared async connection.
+///
+/// Clones multiplex the same connection and reconnect automatically. Initialize the
+/// store once before starting workers. Keys encode prefix, rule, window, quota and
+/// client ID. Client IDs should be internal identifiers, never raw credentials.
+///
+/// Detailed checks return quota metadata from the same atomic Lua invocation,
+/// normally requiring one network round trip. A script cache miss can require
+/// reloading the script. Fail-open decisions omit metadata because quota is unknown.
+#[derive(Clone)]
+pub struct RedisStore {
+    connection: ConnectionManager,
+    prefix: String,
+    options: RedisStoreOptions,
+}
+
+impl RedisStore {
+    /// Connects and verifies Redis asynchronously, using the default options.
+    pub async fn new(redis_url: &str) -> RedisResult<Self> {
+        Self::with_options(redis_url, RedisStoreOptions::default()).await
+    }
+
+    /// Connects, verifies PING and loads the admission script within one deadline.
+    pub async fn with_options(redis_url: &str, options: RedisStoreOptions) -> RedisResult<Self> {
+        if options.timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Redis timeout must be greater than zero",
+            )
+            .into());
+        }
+        let client = Client::open(redis_url)?;
+        let config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(options.timeout))
+            .set_response_timeout(Some(options.timeout));
+        let connection = tokio::time::timeout(options.timeout, async {
+            let mut connection = ConnectionManager::new_with_config(client, config).await?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut connection)
+                .await?;
+            SCRIPT.load_async(&mut connection).await?;
+            Ok::<_, RedisError>(connection)
+        })
+        .await
+        .map_err(|_| Self::timeout_error())??;
+        Ok(Self {
+            connection,
+            prefix: "rate_limit:".to_owned(),
+            options,
+        })
+    }
+
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefix = prefix.to_owned();
+        self
+    }
+
+    fn timeout_error() -> RedisError {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Redis rate limit deadline exceeded",
+        )
+        .into()
+    }
+
+    fn get_key(&self, key: &str, config: &RateLimitConfig) -> String {
+        // Byte-length framing prevents collisions even when identifiers contain colons.
+        format!(
+            "{}v2:{}:{}:{}:{}:{}:{}",
+            self.prefix,
+            config.namespace.len(),
+            config.namespace,
+            config.window_secs.as_nanos(),
+            config.max_requests,
+            key.len(),
+            key
+        )
+    }
+
+    async fn check_limited(&self, key: &str, config: &RateLimitConfig) -> RedisResult<bool> {
+        let mut connection = self.connection.clone();
+        // Round up sub-microsecond durations so Redis never expires a request early.
+        let window_micros = config.window_secs.as_nanos().div_ceil(1_000) as u64;
+        let limited: bool = SCRIPT
+            .key(self.get_key(key, config))
+            .arg(window_micros)
+            .arg(config.max_requests)
+            .invoke_async(&mut connection)
+            .await?;
+        Ok(limited)
+    }
+
+    async fn check_detailed(
+        &self,
+        key: &str,
+        config: &RateLimitConfig,
+    ) -> RedisResult<RateLimitDecision> {
+        let mut connection = self.connection.clone();
+        let window_micros = config.window_secs.as_nanos().div_ceil(1_000) as u64;
+        let (limited, remaining, retry_micros): (u8, usize, u64) = SCRIPT
+            .key(self.get_key(key, config))
+            .arg(window_micros)
+            .arg(config.max_requests)
+            .arg("details")
+            .invoke_async(&mut connection)
+            .await?;
+        match (limited, remaining, retry_micros) {
+            (0, remaining, 0) if remaining < config.max_requests => Ok(RateLimitDecision {
+                allowed: true,
+                metadata: Some(RateLimitMetadata {
+                    remaining,
+                    retry_after: None,
+                }),
+            }),
+            (1, 0, retry) if retry > 0 => Ok(RateLimitDecision {
+                allowed: false,
+                metadata: Some(RateLimitMetadata {
+                    remaining: 0,
+                    retry_after: Some(Duration::from_micros(retry)),
+                }),
+            }),
+            // A syntactically valid but inconsistent Lua reply is a backend
+            // protocol error, not a network/connection failure.
+            _ => Err(RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "invalid Redis rate limit metadata",
+            ))),
+        }
+    }
+
+    fn handle_error(&self, error: RedisError) -> Result<(), StoreError> {
+        // Do not log client IDs, Redis URLs or server-provided error details.
+        log::warn!(
+            "Redis rate limit check failed; policy={:?}",
+            self.options.failure_policy
+        );
+        match self.options.failure_policy {
+            FailurePolicy::FailOpen => Ok(()),
+            FailurePolicy::FailClosed => Err(StoreError::new(error)),
+        }
+    }
+}
+
+impl RateLimitStore for RedisStore {
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            config.validate().map_err(StoreError::new)?;
+            if config.max_requests == 0 {
+                return Ok(RateLimitDecision {
+                    allowed: false,
+                    metadata: metadata.then_some(RateLimitMetadata {
+                        remaining: 0,
+                        retry_after: None,
+                    }),
+                }
+                .into());
+            }
+            let result = tokio::time::timeout(self.options.timeout, async {
+                if metadata {
+                    self.check_detailed(key, config).await
+                } else {
+                    self.check_limited(key, config)
+                        .await
+                        .map(|limited| RateLimitDecision {
+                            allowed: !limited,
+                            metadata: None,
+                        })
+                }
+            })
+            .await
+            .unwrap_or_else(|_| Err(Self::timeout_error()));
+            match result {
+                Ok(decision) => Ok(decision.into()),
+                Err(error) => {
+                    let kind = super::traits::classify_redis_error(&error);
+                    self.handle_error(error)?;
+                    Ok(ObservedRateLimitDecision {
+                        decision: RateLimitDecision {
+                            allowed: true,
+                            metadata: None,
+                        },
+                        fail_open: true,
+                        error_kind: Some(kind),
+                    })
+                }
+            }
+        })
+    }
+
+    fn is_limited<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            config.validate().map_err(StoreError::new)?;
+            if config.max_requests == 0 {
+                return Ok(true);
+            }
+            let result =
+                tokio::time::timeout(self.options.timeout, self.check_limited(key, config))
+                    .await
+                    .unwrap_or_else(|_| Err(Self::timeout_error()));
+            match result {
+                Ok(limited) => Ok(limited),
+                Err(error) => self.handle_error(error).map(|()| false),
+            }
+        })
+    }
+
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            config.validate().map_err(StoreError::new)?;
+            if config.max_requests == 0 {
+                return Ok(RateLimitDecision {
+                    allowed: false,
+                    metadata: Some(RateLimitMetadata {
+                        remaining: 0,
+                        retry_after: None,
+                    }),
+                });
+            }
+            let result =
+                tokio::time::timeout(self.options.timeout, self.check_detailed(key, config))
+                    .await
+                    .unwrap_or_else(|_| Err(Self::timeout_error()));
+            match result {
+                Ok(decision) => Ok(decision),
+                Err(error) => self.handle_error(error).map(|()| RateLimitDecision {
+                    allowed: true,
+                    metadata: None,
+                }),
+            }
+        })
+    }
+}

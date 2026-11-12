@@ -1,0 +1,5 @@
+.git
+target
+benchmarks/target
+benchmarks/results
+__pycache__

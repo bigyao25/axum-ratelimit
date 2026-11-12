@@ -1,0 +1,119 @@
+name: Validate or Publish Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Expected Cargo.toml version
+        required: true
+        type: string
+        default: '0.1.0'
+      dry_run:
+        description: Validate only; do not publish or create a tag
+        type: boolean
+        default: true
+permissions: {}
+concurrency:
+  group: crates-io-release
+  cancel-in-progress: false
+jobs:
+  authorize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const repository = await github.rest.repos.get({ owner, repo });
+            if (context.ref !== `refs/heads/${repository.data.default_branch}`) {
+              throw new Error('Release validation/publishing must run from the default branch.');
+            }
+            const actors = new Set([context.actor, process.env.GITHUB_TRIGGERING_ACTOR]);
+            for (const username of actors) {
+              if (!username) throw new Error('Unable to identify triggering actor.');
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
+              if (data.permission !== 'admin') throw new Error(`Only repository administrators may release: ${username}`);
+            }
+
+  validate:
+    needs: authorize
+    uses: ./.github/workflows/CI.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: [authorize, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Real releases require committed lockfiles
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git ls-files --error-unmatch Cargo.lock benchmarks/Cargo.lock
+          test -z "$(git status --porcelain)"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify exact requested version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          package = tomllib.loads(Path('Cargo.toml').read_text())['package']
+          if package['name'] != 'axum-ratelimit' or package['version'] != os.environ['EXPECTED_VERSION']:
+              raise SystemExit('Package name or requested version mismatch')
+          PY
+      - name: Dry run with the committed lockfile
+        run: cargo publish --locked --dry-run --allow-dirty
+      - name: Publish explicitly authorized release
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN"
+          test -z "$(git status --porcelain)"
+          cargo publish --locked
+
+  tag:
+    if: ${{ !inputs.dry_run }}
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/github-script@v9
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const version = process.env.RELEASE_VERSION;
+            const tag = `v${version}`;
+            try {
+              const { data } = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              if (data.object.sha !== context.sha) throw new Error('Existing tag points to a different commit.');
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha: context.sha });
+            }
+            try {
+              const { data } = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              if (data.draft) throw new Error('An existing draft release requires manual review.');
+              core.info(`Release already exists: ${data.html_url}`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, name: tag, target_commitish: context.sha,
+                body: `Published crate: https://crates.io/crates/axum-ratelimit/${version}`,
+                generate_release_notes: true, draft: false, prerelease: version.includes('-'),
+              });
+            }

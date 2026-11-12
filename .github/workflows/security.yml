@@ -1,0 +1,82 @@
+name: Security
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  codeql:
+    name: Analyze Rust with CodeQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:rust
+
+  dependencies:
+    name: Dependency advisories and licenses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Verify committed lockfiles
+        run: |
+          test -f Cargo.lock
+          test -f benchmarks/Cargo.lock
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path benchmarks/Cargo.toml
+      - run: cargo deny --all-features --locked check
+
+  secrets:
+    name: Detect leaked credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_opts='--all'
+          if [ "$EVENT_NAME" = pull_request ]; then
+            base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            log_opts="$base..$HEAD_SHA"
+          elif [ "$EVENT_NAME" = push ] && [ -n "$BASE_SHA" ] && \
+               [ "$BASE_SHA" != 0000000000000000000000000000000000000000 ] && \
+               git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            log_opts="$BASE_SHA..$HEAD_SHA"
+          fi
+          docker run --rm --user "$(id -u):$(id -g)" --volume "$PWD:/repo:ro" \
+            zricethezav/gitleaks:v8.24.3 git /repo --redact --log-opts="$log_opts"

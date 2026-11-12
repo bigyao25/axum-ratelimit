@@ -1,0 +1,175 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+jobs:
+  locks:
+    name: Verify committed dependency locks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: Verify committed lockfiles
+        run: |
+          test -f Cargo.lock
+          test -f benchmarks/Cargo.lock
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path benchmarks/Cargo.toml
+
+  format:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check both workspaces
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path benchmarks/Cargo.toml --all -- --check
+
+  tooling:
+    name: Python tooling and standalone Lua regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y lua5.1
+      - run: python3 scripts/check.py --static
+      - name: Validate workflow syntax
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
+  build:
+    name: Test (${{ matrix.os }}, ${{ matrix.features }})
+    needs: locks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+        features: [default, no-default]
+        include:
+          - features: default
+            cargo-flags: ''
+          - features: no-default
+            cargo-flags: --no-default-features
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets ${{ matrix.cargo-flags }} -- -D warnings
+      - run: cargo test --locked --lib --tests --examples ${{ matrix.cargo-flags }}
+      - run: cargo test --locked --doc ${{ matrix.cargo-flags }}
+      - run: cargo check --locked --benches ${{ matrix.cargo-flags }}
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps ${{ matrix.cargo-flags }}
+
+  redis:
+    name: Real Redis (${{ matrix.redis }})
+    needs: locks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: [redis:7-alpine, redis:8-alpine]
+    services:
+      redis:
+        image: ${{ matrix.redis }}
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - env:
+          REDIS_URL: redis://127.0.0.1:6379/
+        run: cargo test --locked --lib --tests --all-features -- --include-ignored
+
+  msrv:
+    name: Minimum Rust 1.89
+    needs: locks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo test --locked --lib --tests --examples --all-features
+      - run: cargo test --locked --lib --tests --examples --no-default-features
+      - run: cargo test --locked --doc --all-features
+      - run: cargo test --locked --doc --no-default-features
+
+  benchmark-build:
+    name: Compile performance tooling without running benchmarks
+    needs: locks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks -> target
+      - run: cargo check --locked --manifest-path benchmarks/Cargo.toml
+
+  package:
+    name: Verify installable crate
+    needs: locks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --locked --allow-dirty
+      - name: Verify unpacked feature sets
+        run: |
+          manifest=$(python3 -c "import tomllib; p=tomllib.load(open('Cargo.toml','rb'))['package']; print('target/package/'+p['name']+'-'+p['version']+'/Cargo.toml')")
+          cargo test --locked --manifest-path "$manifest" --lib --tests --examples --all-features
+          cargo test --locked --manifest-path "$manifest" --lib --tests --examples --no-default-features
+          cargo test --locked --manifest-path "$manifest" --doc --all-features

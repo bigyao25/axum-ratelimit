@@ -1,0 +1,201 @@
+use crate::config::RateLimitConfig;
+use crate::observability::{ObservedRateLimitDecision, RateLimitErrorKind};
+use futures_util::future::BoxFuture;
+use std::{error::Error, fmt, sync::Arc, time::Duration};
+
+/// The result of one atomic admission, optionally including a quota snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    pub allowed: bool,
+    /// Absent when a store cannot provide a reliable snapshot (including fail-open).
+    pub metadata: Option<RateLimitMetadata>,
+}
+
+/// Quota state immediately after checking and, if allowed, recording this request.
+/// Concurrent requests can consume the remaining quota before it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitMetadata {
+    /// Available quota after admitting the current request; the `r` header parameter.
+    /// This snapshot does not reserve quota for future requests.
+    pub remaining: usize,
+    /// Earliest retry delay for a rejected request, assuming no competing admissions.
+    /// `None` for admitted requests, unknown delays, or a permanently zero quota.
+    pub retry_after: Option<Duration>,
+}
+
+/// An invalid configuration or an unavailable storage backend.
+#[derive(Debug)]
+pub struct StoreError(Box<dyn Error + Send + Sync>);
+
+impl StoreError {
+    pub fn new(error: impl Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+
+    /// Best-effort classification; never formats or exposes the error message.
+    pub fn kind(&self) -> RateLimitErrorKind {
+        #[cfg(feature = "redis")]
+        if let Some(error) = self.0.downcast_ref::<redis::RedisError>() {
+            return classify_redis_error(error);
+        }
+        if let Some(error) = self.0.downcast_ref::<std::io::Error>() {
+            return match error.kind() {
+                std::io::ErrorKind::TimedOut => RateLimitErrorKind::Timeout,
+                std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => RateLimitErrorKind::Connection,
+                _ => RateLimitErrorKind::Other,
+            };
+        }
+        RateLimitErrorKind::Other
+    }
+}
+
+#[cfg(feature = "redis")]
+pub(crate) fn classify_redis_error(error: &redis::RedisError) -> RateLimitErrorKind {
+    if error.is_timeout() {
+        RateLimitErrorKind::Timeout
+    } else if error.is_io_error() {
+        RateLimitErrorKind::Connection
+    } else {
+        RateLimitErrorKind::Backend
+    }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Error for StoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Checks and records requests in the half-open window `(now - window, now]`.
+///
+/// Only admitted requests are recorded. `Ok(true)` rejects a request with HTTP 429;
+/// an error produces HTTP 503 in the middleware. Implementations must perform the
+/// check and admission atomically, and must not block the executor with network I/O.
+///
+/// ```
+/// use axum_ratelimit::{RateLimitConfig, store::{RateLimitStore, StoreError}};
+/// use futures_util::future::BoxFuture;
+///
+/// struct DenyAll;
+/// impl RateLimitStore for DenyAll {
+///     fn is_limited<'a>(&'a self, _key: &'a str, config: &'a RateLimitConfig)
+///         -> BoxFuture<'a, Result<bool, StoreError>>
+///     {
+///         Box::pin(async move {
+///             config.validate().map_err(StoreError::new)?;
+///             Ok(true)
+///         })
+///     }
+/// }
+/// ```
+pub trait RateLimitStore: Send + Sync {
+    /// Optional observation path. Calls exactly one existing method: `check` when
+    /// metadata is requested, otherwise `is_limited`. Override to expose explicit
+    /// fail-open state; missing metadata alone never means fail-open. Return after
+    /// releasing storage locks. `Arc` and `Box` forward all methods.
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            let decision = if metadata {
+                self.check(key, config).await?
+            } else {
+                RateLimitDecision {
+                    allowed: !self.is_limited(key, config).await?,
+                    metadata: None,
+                }
+            };
+            Ok(decision.into())
+        })
+    }
+
+    fn is_limited<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Check and record exactly once, with optional metadata from the same operation.
+    /// The default calls `is_limited` once and returns no fabricated metadata.
+    /// Call this OR `is_limited` for a request: calling both admits twice.
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            Ok(RateLimitDecision {
+                allowed: !self.is_limited(key, config).await?,
+                metadata: None,
+            })
+        })
+    }
+}
+
+impl<T: RateLimitStore + ?Sized> RateLimitStore for Box<T> {
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        (**self).check_observed(key, config, metadata)
+    }
+
+    fn is_limited<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        (**self).is_limited(key, config)
+    }
+
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        (**self).check(key, config)
+    }
+}
+
+impl<T: RateLimitStore + ?Sized> RateLimitStore for Arc<T> {
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        (**self).check_observed(key, config, metadata)
+    }
+
+    fn is_limited<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        (**self).is_limited(key, config)
+    }
+
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        (**self).check(key, config)
+    }
+}
