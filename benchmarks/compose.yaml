@@ -28,6 +28,7 @@ services:
       WINDOW: ${WINDOW}
       WORKERS: ${WORKERS:-2}
       DIAGNOSTICS: ${DIAGNOSTICS:-0}
+      SERVER_NODELAY: ${SERVER_NODELAY:-1}
     depends_on:
       redis:
         condition: service_healthy

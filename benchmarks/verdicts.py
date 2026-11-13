@@ -16,7 +16,7 @@ def context(row):
     scenario=row.get('scenario','').rsplit('/',1)[0]
     return tuple(row.get(k) for k in ('platform_id','resource_layout_id','http_version',
                  'resource_profile','server_cpu_limit','loadgen_cpu_limit',
-                 'admission_policy','reuse_warmup_pool','instrumented'))+(scenario,)
+                 'admission_policy','reuse_warmup_pool','instrumented','server_nodelay'))+(scenario,)
 
 
 def qualified(items):

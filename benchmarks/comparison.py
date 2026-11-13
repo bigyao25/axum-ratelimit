@@ -13,7 +13,7 @@ def contrasts(rows):
             continue
         key=tuple(row.get(k) for k in ('platform_id','scenario','target_rps','measurement_seconds',
                                       'warmup_seconds','http_version','resource_layout_id','resource_profile','server_cpu_limit','loadgen_cpu_limit','quota','window_seconds'))
-        key+=tuple(row.get(k) for k in ('admission_policy','reuse_warmup_pool','instrumented'))
+        key+=tuple(row.get(k) for k in ('admission_policy','reuse_warmup_pool','instrumented','server_nodelay'))
         groups[key].append(row)
     result=[]
     for group in groups.values():
@@ -54,6 +54,8 @@ def scorecard(rows):
             ratio=cpu/hcpu if comparable and hcpu and cpu is not None else None
             result.append(dict(condition=context[-1],platform_id=context[0],rate=rate,variant=name,
                 admission_policy=items[0].get('admission_policy','legacy-drop'),
+                server_nodelay=items[0].get('server_nodelay'),instrumented=items[0].get('instrumented'),
+                reuse_warmup_pool=items[0].get('reuse_warmup_pool'),
                 recorded=len(items),passing=passed,qualified=qualified,response_mix_matched=matched,
                 http_rps=med(items,'http_rps'),p99_ms=med(items,'p99_ms'),
                 server_cpu_pct=cpu,cpu_vs_head=ratio,

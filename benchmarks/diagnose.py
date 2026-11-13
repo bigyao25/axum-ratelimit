@@ -11,9 +11,10 @@ import signal
 import report
 
 HERE=Path(__file__).resolve().parent
-PROFILES=[('drop-cold',['--admission-policy','drop','--cold-pool']),
-          ('drop-warm',['--admission-policy','drop']),
-          ('wait-warm',['--admission-policy','wait'])]
+PROFILES=[('drop-cold',['--admission-policy','drop','--cold-pool','--server-nagle']),
+          ('drop-warm',['--admission-policy','drop','--server-nagle']),
+          ('wait-warm',['--admission-policy','wait','--server-nagle']),
+          ('wait-warm-nodelay',['--admission-policy','wait'])]
 
 
 def median(items, key):
@@ -50,14 +51,14 @@ def summarize(rows):
 def markdown(data, status='unknown', artifact_url=''):
     fmt=lambda v:'N/A' if v is None else f'{v:.2f}'
     lines=['# Queue diagnosis','',f"Execution: **{status}**; backend **{data['backend']}**; target **{data['rate']:,} RPS**.",
-           'Three profiles run on the same host and images. Each has baseline and HEAD, 2-second warmup, 30-second measurement, three repeats. These are diagnostic observations, not five-repeat capacity claims. Server timing and runtime probes are enabled equally for every profile.','',
+           'Four profiles run on the same host and images. Each has baseline and HEAD, 2-second warmup, 30-second measurement, three repeats; profile and product order reverse in alternating repeat blocks. These are diagnostic observations, not five-repeat capacity claims. Server timing and runtime probes are enabled equally for every profile.','',
            '| Profile | Product | Passing / rounds | HTTP RPS | Request p99 ms | Capacity / scheduler drops | New connections | Admission max ms | Pool max ms | Response max ms | Service max ms | Server runtime max ms | Generator runtime max ms |',
            '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for c in data.get('cells',[]):
         lines.append(f"| {c['profile']} | {c['variant']} | {c['passing']}/{c['rounds']} | {fmt(c['http_rps'])} | {fmt(c['p99_ms'])} | "
                      f"{c['capacity_drops']} / {c['scheduler_drops']} | {c['new_connections']} | {fmt(c['admission_max_ms'])} | {fmt(c['pool_max_ms'])} | "
                      f"{fmt(c['response_max_ms'])} | {fmt(c['service_max_ms'])} | {fmt(c['server_runtime_max_ms'])} | {fmt(c['generator_runtime_max_ms'])} |")
-    lines+=['','`drop-cold` preserves the former client behavior; `drop-warm` changes only connection reuse; `wait-warm` additionally queues one pending admission for at most 100 ms from its original due time. Concurrency remains 512, requests are never retried, all intended arrivals remain in accounting, and schedule-inclusive latency includes admission waiting.',
+    lines+=['','`drop-cold` preserves the former client behavior; `drop-warm` changes only connection reuse; `wait-warm` additionally queues one pending admission for at most 100 ms from its original due time. Concurrency remains 512, requests are never retried, all intended arrivals remain in accounting, and schedule-inclusive latency includes admission waiting. The first three profiles keep server Nagle enabled; `wait-warm-nodelay` changes only server TCP_NODELAY to true.',
             'A service-time spike includes middleware/handler work and Redis waiting. Server runtime lag includes executor/OS scheduling. Response latency additionally includes transport and kernel/runtime queues. These signals narrow causes but do not alone prove a library defect or host interference. Raw slow examples, drop events, host CPU/pressure and Redis diagnostics retain event/context evidence.']
     for c in data.get('cells',[]):
         lines.append(f"- {c['profile']} / {c['variant']}: throttled CPU microseconds: server {c.get('server_throttled_usec',0)}, Redis {c.get('redis_throttled_usec',0)}, generator {c.get('generator_throttled_usec',0)}; slowest logged Redis command {c.get('redis_slowlog_max_ms',0):.2f} ms (diagnostic threshold 1 ms).")
@@ -76,32 +77,35 @@ def main():
     def interrupted(*_):raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM,interrupted)
     if a.plan:
-        print(json.dumps(dict(backend=a.backend,rate=rate,profiles=[x[0] for x in PROFILES],rounds=18,load_seconds=576)));return
+        print(json.dumps(dict(backend=a.backend,rate=rate,profiles=[x[0] for x in PROFILES],rounds=24,load_seconds=768)));return
     if a.output.exists() and any(c.name!='run.log' for c in a.output.iterdir()):p.error('Use a fresh output directory')
     a.output.mkdir(parents=True,exist_ok=True)
     rows=[];environments=[];manifest=None;status='failure';data=dict(backend=a.backend,rate=rate)
     try:
-        for profile,options in PROFILES:
-            child=a.output/profile
-            command=[sys.executable,str(HERE/'bench.py'),'compare','--backends',a.backend,
-                '--variants','baseline','head','--clients','1','--modes','allow','--rates',str(rate),
-                '--duration','30','--warmup','2','--repeats','3','--diagnostics',*options,'--output',str(child)]
-            if manifest:command+=['--reuse-build-manifest',str(manifest)]
-            if a.allow_dirty:command+=['--allow-dirty']
-            process=subprocess.Popen(command)
-            try:code=process.wait()
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:process.kill();process.wait()
-            if (child/'environment.json').exists():
-                env=json.loads((child/'environment.json').read_text());environments.append(env)
-                if manifest is None and env.get('images'):manifest=child/'environment.json'
-            if (child/'raw.json').exists():
-                rows += [dict(r,campaign_stage='diagnostic',diagnostic_profile=profile)
-                         for r in json.loads((child/'raw.json').read_text())['rounds']]
-            if code not in (0,75):raise RuntimeError(f'Diagnostic profile {profile} failed with exit {code}')
+        for block in range(3):
+            profiles=PROFILES if block%2==0 else list(reversed(PROFILES))
+            for profile,options in profiles:
+                child=a.output/f'{profile}-{block}'
+                products=['baseline','head'] if block%2==0 else ['head','baseline']
+                command=[sys.executable,str(HERE/'bench.py'),'compare','--backends',a.backend,
+                    '--variants',*products,'--clients','1','--modes','allow','--rates',str(rate),
+                    '--duration','30','--warmup','2','--repeats','1','--diagnostics',*options,'--output',str(child)]
+                if manifest:command+=['--reuse-build-manifest',str(manifest)]
+                if a.allow_dirty:command+=['--allow-dirty']
+                process=subprocess.Popen(command)
+                try:code=process.wait()
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:process.wait(timeout=15)
+                        except subprocess.TimeoutExpired:process.kill();process.wait()
+                if (child/'environment.json').exists():
+                    env=json.loads((child/'environment.json').read_text());environments.append(env)
+                    if manifest is None and env.get('images'):manifest=child/'environment.json'
+                if (child/'raw.json').exists():
+                    rows += [dict(r,campaign_stage='diagnostic',diagnostic_profile=profile,repeat=block)
+                             for r in json.loads((child/'raw.json').read_text())['rounds']]
+                if code not in (0,75):raise RuntimeError(f'Diagnostic profile {profile} failed with exit {code}')
         if len({r['platform_id'] for r in rows})!=1:raise RuntimeError('Diagnostic host changed')
         if len({e['git_sha'] for e in environments})!=1:raise RuntimeError('Diagnostic source changed')
         status='completed'

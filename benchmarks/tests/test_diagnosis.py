@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).parents[1]))
 import comparison
 import diagnose
@@ -54,6 +55,38 @@ class DiagnosisTest(unittest.TestCase):
         summarized=report.summarize(dict(rounds=rows))
         self.assertEqual(len(summarized['summary']),6)
         self.assertEqual(len(verdicts.analyze(rows)['capacity']),2)
+        socket_rows=[row(v,repeat=i,server_nodelay=enabled)
+                     for i in range(5) for v in ('baseline','head','governor') for enabled in (False,True)]
+        self.assertEqual(len(comparison.scorecard(socket_rows)),6)
+        self.assertEqual(len(verdicts.analyze(socket_rows)['capacity']),2)
+
+    def test_controlled_tcp_experiment_balances_order_and_keeps_three_repeats(self):
+        calls=[]
+        def launch(command):
+            def value(name):return command[command.index(name)+1]
+            variants=command[command.index('--variants')+1:command.index('--clients')]
+            folder=Path(value('--output'));folder.mkdir()
+            enabled='--server-nagle' not in command
+            calls.append((variants,enabled))
+            records=[row(v,server_nodelay=enabled,measurement_seconds=30) for v in variants]
+            (folder/'raw.json').write_text(json.dumps(dict(rounds=records)))
+            (folder/'environment.json').write_text(json.dumps(dict(git_sha='sha',images={'shared':'id'})))
+            class Process:
+                def wait(self):return 0
+                def poll(self):return 0
+            return Process()
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)/'run'
+            with patch.object(sys,'argv',['diagnose.py','--backend','memory','--output',str(root)]), \
+                 patch.object(diagnose.subprocess,'Popen',side_effect=launch),patch.object(diagnose.signal,'signal'):
+                diagnose.main()
+            rows=json.loads((root/'raw.json').read_text())['rounds']
+            cells=json.loads((root/'diagnosis.json').read_text())['cells']
+            self.assertEqual(len(rows),24)
+            self.assertEqual(len(cells),8)
+            self.assertTrue(all(c['rounds']==3 for c in cells))
+            self.assertEqual(calls[0],(['baseline','head'],False))
+            self.assertEqual(calls[4],(['head','baseline'],True))
 
     def test_diagnostic_matrix_and_flat_artifact_summary(self):
         self.assertEqual([c['shard'] for c in workflow.matrix('diagnose')['include']],['memory','redis'])

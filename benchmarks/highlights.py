@@ -100,7 +100,7 @@ def confirmation_coverage(rows, requested=(), backend=None):
                  ('platform_id','resource_layout_id','http_version','resource_profile',
                   'server_cpu_limit','loadgen_cpu_limit','measurement_seconds','warmup_seconds',
                   'quota','window_seconds'))
-            key+=tuple(row.get(k) for k in ('admission_policy','reuse_warmup_pool','instrumented'))
+            key+=tuple(row.get(k) for k in ('admission_policy','reuse_warmup_pool','instrumented','server_nodelay'))
             groups[key][row['variant']].append(row)
     expected={(backend,case['clients'],case['mode']) for case in requested} if backend else set()
     if not expected:

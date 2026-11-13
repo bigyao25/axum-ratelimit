@@ -131,6 +131,7 @@ def main():
     p.add_argument('--admission-policy',choices=['wait','drop'],default='wait')
     p.add_argument('--cold-pool',action='store_true',help='Diagnostic legacy behavior: discard the warmup pool')
     p.add_argument('--diagnostics',action='store_true',help='Instrument server service time and runtime wakeup; separate from uninstrumented comparisons')
+    p.add_argument('--server-nagle',action='store_true',help='Diagnostic legacy server TCP_NODELAY=false')
     p.add_argument('--skip-build', action='store_true')
     p.add_argument('--reuse-build-manifest',type=str,help='Reuse images only after verifying recorded source, build settings and image IDs')
     p.add_argument('--output', type=Path, default=HERE/'results'/time.strftime('%Y%m%d-%H%M%S'))
@@ -283,7 +284,8 @@ def main():
     env['LOADGEN_IMAGE']=generator_image
     env['PHASE_BARRIER']='1' if compare else '0'
     env.update(ADMISSION_POLICY=a.admission_policy,REUSE_WARMUP_POOL='0' if a.cold_pool else '1',
-               DIAGNOSTICS='1' if a.diagnostics else '0',REDIS_SLOWLOG_THRESHOLD='1000' if a.diagnostics else '10000')
+               DIAGNOSTICS='1' if a.diagnostics else '0',REDIS_SLOWLOG_THRESHOLD='1000' if a.diagnostics else '10000',
+               SERVER_NODELAY='0' if a.server_nagle else '1')
     for key in ('server_cpus','loadgen_cpus','redis_cpus','workers','server_cpuset','loadgen_cpuset','redis_cpuset'):
         env.setdefault(key.upper(),str(resource[key]))
     # CPU quotas are authoritative for the selected layout.
@@ -376,6 +378,7 @@ def main():
                                       loadgen_throttled_usec=lg_cpu['throttled_usec'],
                                       warmup_seconds=a.warmup, resource_interval_seconds=diagnostic_seconds,
                                       instrumented=a.diagnostics,
+                                      server_nodelay=not a.server_nagle,
                                       resource_phase='measurement' if compare else 'warmup-and-measurement',
                                       resource_capture_skew_seconds=max(0,diagnostic_seconds-result['elapsed_seconds']) if compare else None,
                                       resource_profile=a.resources, server_cpu_limit=resource['server_cpus'],

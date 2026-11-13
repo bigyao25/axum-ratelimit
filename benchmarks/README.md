@@ -109,10 +109,19 @@ long campaign. Report-only runs do not cancel active measurement runs.
 
 ## Queue diagnostics and client method
 
+The shared benchmark server explicitly enables TCP_NODELAY for every accepted
+socket and every product. Axum 0.8.9 leaves this socket option at the OS default;
+Nagle plus delayed ACK can add transport latency outside the limiter/handler.
+CLI `--server-nagle` retains the former setting for the same-host A/B experiment.
+This is server harness configuration, not a change to the rate-limiting crate.
+[Axum listener configuration](https://docs.rs/axum/0.8.9/axum/serve/trait.ListenerExt.html)
+
+
 Select `suite=diagnose` and either or both backends to run controlled single-client
 allow experiments at 35k Memory / 20k Redis RPS. The same runner and images run
-baseline and HEAD with three profiles: legacy drop/cold pool, drop/warm pool, and
-bounded admission/warm pool. Each uses three 30-second repetitions and 2-second
+baseline and HEAD with four profiles: legacy drop/cold pool, drop/warm pool, bounded
+admission/warm pool, and the same client with server TCP_NODELAY enabled.
+Profile and product order reverse across repeat blocks. Each uses three 30-second repetitions and 2-second
 warmup. Diagnostic response headers and runtime probes are enabled for all peers
 in this suite, so these measurements are separate from formal uninstrumented
 performance comparisons. `diagnosis.json` and the overview summarize each profile.
