@@ -83,13 +83,14 @@ def summarize(data):
         reasons = validate(item)
         annotated.append({**item, "invalid_reasons": reasons, "load_failure_reasons": load_failures(item)})
         if not reasons and not load_failures(item):
-            key = (item["platform_id"], item["variant"], item["scenario"], item.get("target_rps"), item.get("measurement_seconds"), item.get("warmup_seconds"))
+            key = (item["platform_id"], item["variant"], item["scenario"], item.get("target_rps"), item.get("measurement_seconds"), item.get("warmup_seconds"),item.get("admission_policy"),item.get("reuse_warmup_pool"),item.get("instrumented"))
             groups.setdefault(key, []).append(item)
     rows = []
-    for (platform, variant, scenario, rate, duration, warmup), items in sorted(groups.items(), key=lambda pair: str(pair[0])):
+    for (platform, variant, scenario, rate, duration, warmup, admission, reuse, instrumented), items in sorted(groups.items(), key=lambda pair: str(pair[0])):
         rps = [item["achieved_rps"] for item in items]
         rows.append({"platform_id": platform, "variant": variant, "scenario": scenario,
                      "target_rps": rate, "measurement_seconds": duration, "warmup_seconds": warmup,
+                     "admission_policy":admission,"reuse_warmup_pool":reuse,"instrumented":instrumented,
                      "p99_min_ms": min(item["p99_ms"] for item in items),
                      "p99_max_ms": max(item["p99_ms"] for item in items),
                      "min_samples": min(item.get("sample_count",sum(item[k] for k in ("http_200","http_429","http_503","http_other","errors"))) for item in items),
@@ -98,7 +99,7 @@ def summarize(data):
                      "min_rps": min(rps), "max_rps": max(rps),
                      "median_p99_ms": statistics.median(item["p99_ms"] for item in items)})
     for row in rows:
-        same = [r for r in rows if r['platform_id']==row['platform_id'] and r['scenario']==row['scenario'] and all(r[k]==row[k] for k in ('target_rps','measurement_seconds','warmup_seconds'))]
+        same = [r for r in rows if r['platform_id']==row['platform_id'] and r['scenario']==row['scenario'] and all(r[k]==row[k] for k in ('target_rps','measurement_seconds','warmup_seconds','admission_policy','reuse_warmup_pool','instrumented'))]
         for variant, label in [('baseline','baseline')]:
             ref = next((r for r in same if r['variant']==variant), None) if row['variant'] not in ('governor','ratelimit') and '/behavior/' not in row['scenario'] else None
             row[label+'_rps_change_pct'] = (100*(row['median_rps']/ref['median_rps']-1) if ref and ref['median_rps'] else None)

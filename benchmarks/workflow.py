@@ -9,6 +9,7 @@ import report
 import verdicts
 import highlights
 import workloads
+import comparison
 
 
 def matrix(suite, backends='both', targets=(), report_run=''):
@@ -21,7 +22,7 @@ def matrix(suite, backends='both', targets=(), report_run=''):
         workloads.parse_targets(targets)
         if suite!='compare' or len(selected)!=1:
             raise ValueError('Targets require compare and one selected backend')
-    if suite=='compare': return {'include':[{'shard':b,'backends':b} for b in selected]}
+    if suite in ('compare','diagnose'): return {'include':[{'shard':b,'backends':b} for b in selected]}
     if suite=='micro': return {'include':[{'shard':'micro','backends':'memory'}]}
     if suite=='smoke': return {'include':[{'shard':'smoke','backends':' '.join(selected)}]}
     raise ValueError('Unknown benchmark suite')
@@ -68,6 +69,10 @@ def aggregate(root, suite, backends='both'):
         plan=json.loads(plan_path.read_text()) if plan_path.exists() else {}
         coverage=highlights.confirmation_coverage(rows,plan.get('requested_cases',()),plan.get('backend'))
         entry['confirmation_coverage']=coverage
+        if suite=='diagnose':
+            entry['confirmation_coverage']=highlights.confirmation_coverage([])
+            sections+=['## '+shard.capitalize(),'',(folder/'assessment.md').read_text() if (folder/'assessment.md').exists() else 'Missing diagnostic assessment.']
+            continue
         verdict_path=folder/'verdicts.json'
         verdict=json.loads(verdict_path.read_text()) if verdict_path.exists() else verdicts.analyze(rows)
         outcome=semantic or ('completed' if complete else 'measurement_failure')
@@ -79,6 +84,7 @@ def aggregate(root, suite, backends='both'):
                                         unresolved=plan.get('environment_unresolved',[]),
                                         requested=plan.get('requested_cases',()),backend=plan.get('backend'),
                                         scope=plan.get('scope','matrix')),
+                     comparison.scorecard_markdown(rows),
                      'Artifact: `'+artifact_name+'`.']
     shas={s['git_sha'] for s in shards if s['git_sha']}
     success=all(s['complete'] for s in shards) and len(shas)==1
@@ -99,13 +105,13 @@ def aggregate(root, suite, backends='both'):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     sub=p.add_subparsers(dest='command',required=True)
-    plan=sub.add_parser('plan');plan.add_argument('--suite',choices=['compare','smoke','micro'],required=True)
+    plan=sub.add_parser('plan');plan.add_argument('--suite',choices=['compare','smoke','micro','diagnose'],required=True)
     plan.add_argument('--github-output',action='store_true')
     plan.add_argument('--backends',choices=['both','memory','redis'],default='both')
     plan.add_argument('--targets',nargs='*',default=[])
     plan.add_argument('--report-run',default='')
     status=sub.add_parser('status');status.add_argument('folder',type=Path);status.add_argument('--outcome',required=True)
-    merge=sub.add_parser('aggregate');merge.add_argument('root',type=Path);merge.add_argument('--suite',choices=['compare','smoke'],required=True)
+    merge=sub.add_parser('aggregate');merge.add_argument('root',type=Path);merge.add_argument('--suite',choices=['compare','smoke','diagnose'],required=True)
     merge.add_argument('--output',type=Path,required=True);merge.add_argument('--github-summary',action='store_true')
     merge.add_argument('--backends',choices=['both','memory','redis'],default='both')
     merge.add_argument('--measurement-run',default='')

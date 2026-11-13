@@ -1,7 +1,7 @@
 services:
   redis:
     image: ${REDIS_IMAGE:-redis:8-alpine}
-    command: [redis-server, --save, '', --appendonly, 'no', --maxmemory, 256mb, --maxmemory-policy, noeviction]
+    command: [redis-server, --save, '', --appendonly, 'no', --maxmemory, 256mb, --maxmemory-policy, noeviction, --slowlog-log-slower-than, '${REDIS_SLOWLOG_THRESHOLD:-10000}']
     cpus: ${REDIS_CPUS:-1}
     cpuset: ${REDIS_CPUSET:-3}
     mem_limit: 512m
@@ -27,6 +27,7 @@ services:
       LIMIT: ${LIMIT}
       WINDOW: ${WINDOW}
       WORKERS: ${WORKERS:-2}
+      DIAGNOSTICS: ${DIAGNOSTICS:-0}
     depends_on:
       redis:
         condition: service_healthy
@@ -45,6 +46,9 @@ services:
       CLIENTS: ${CLIENTS}
       DURATION: ${DURATION}
       WARMUP: ${WARMUP}
+      ADMISSION_POLICY: ${ADMISSION_POLICY:-wait}
+      REUSE_WARMUP_POOL: ${REUSE_WARMUP_POOL:-1}
+      DIAGNOSTICS: ${DIAGNOSTICS:-0}
     depends_on: [server]
 networks:
   default:

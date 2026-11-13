@@ -23,15 +23,18 @@ const QUEUED_TASK_LIMIT: usize = 16;
 struct Histogram {
     bins: Vec<u64>,
     count: u64,
+    maximum: u64,
 }
 impl Histogram {
     fn new() -> Self {
         Self {
             bins: vec![0; BINS],
             count: 0,
+            maximum: 0,
         }
     }
     fn add(&mut self, micros: u64) {
+        self.maximum = self.maximum.max(micros);
         let bin = if micros <= 100_000 {
             micros.div_ceil(10)
         } else if micros <= 1_000_000 {
@@ -43,10 +46,13 @@ impl Histogram {
         self.count += 1;
     }
     fn percentile(&self, p: u64) -> Option<f64> {
+        self.percentile_bp(p * 100)
+    }
+    fn percentile_bp(&self, p: u64) -> Option<f64> {
         if self.count == 0 {
             return None;
         }
-        let rank = (self.count * p).div_ceil(100);
+        let rank = (self.count * p).div_ceil(10000);
         let mut count = 0;
         for (i, n) in self.bins.iter().enumerate() {
             count += n;
@@ -63,7 +69,9 @@ impl Histogram {
         None
     }
     fn json(&self) -> Value {
-        json!({"p50_ms":self.percentile(50),"p95_ms":self.percentile(95),"p99_ms":self.percentile(99)})
+        json!({"p50_ms":self.percentile(50),"p95_ms":self.percentile(95),"p99_ms":self.percentile(99),
+            "p999_ms":self.percentile_bp(9990),"p9999_ms":self.percentile_bp(9999),
+            "max_ms":if self.count>0 {Some(self.maximum as f64/1000.0)} else {None},"samples":self.count})
     }
 }
 // Idle connections are recycled before a request is written; requests are never replayed.
@@ -124,6 +132,25 @@ async fn exchange(pool: Pool, identity: String) -> Result<u16, ClientError> {
     exchange_at(pool, identity, "server:8080").await
 }
 async fn exchange_at(pool: Pool, identity: String, address: &str) -> Result<u16, ClientError> {
+    exchange_observed(pool, identity, address)
+        .await
+        .map(|r| r.status)
+}
+#[derive(Default)]
+struct Exchange {
+    status: u16,
+    pool_us: u64,
+    connect_us: u64,
+    response_us: u64,
+    service_us: Option<u64>,
+    runtime_us: Option<u64>,
+}
+async fn exchange_observed(
+    pool: Pool,
+    identity: String,
+    address: &str,
+) -> Result<Exchange, ClientError> {
+    let pool_started = Instant::now();
     let mut pooled = None;
     loop {
         let Some(idle) = pool.idle.lock().await.pop_front() else {
@@ -145,6 +172,8 @@ async fn exchange_at(pool: Pool, identity: String, address: &str) -> Result<u16,
         }
     }
     let reused = pooled.is_some();
+    let pool_us = pool_started.elapsed().as_micros() as u64;
+    let connected = Instant::now();
     let mut connection = if let Some(connection) = pooled {
         pool.counters.reused.fetch_add(1, Ordering::Relaxed);
         connection
@@ -158,6 +187,14 @@ async fn exchange_at(pool: Pool, identity: String, address: &str) -> Result<u16,
         pool.counters.created.fetch_add(1, Ordering::Relaxed);
         BufReader::new(stream)
     };
+    let connect_us = if reused {
+        0
+    } else {
+        connected.elapsed().as_micros() as u64
+    };
+    let response_started = Instant::now();
+    let mut service_us = None;
+    let mut runtime_us = None;
     let result=async {
         connection.write_all(format!("GET / HTTP/1.1\r\nHost: server\r\nx-bench-client: {identity}\r\nConnection: keep-alive\r\n\r\n").as_bytes()).await.map_err(|e|ClientError::io("write",e))?;
         let mut line=String::new();
@@ -172,6 +209,8 @@ async fn exchange_at(pool: Pool, identity: String, address: &str) -> Result<u16,
             if line=="\r\n" {break;}
             if let Some((key,value))=line.split_once(':') {
                 match key.to_ascii_lowercase().as_str() {
+                    "x-bench-service-us"=>service_us=value.trim().parse::<u64>().ok(),
+                    "x-bench-runtime-us"=>runtime_us=value.trim().parse::<u64>().ok(),
                     "content-length"=>length=Some(value.trim().parse::<usize>().map_err(|_|ClientError::protocol("framing","invalid_length"))?),
                     "transfer-encoding"=>chunked=value.to_ascii_lowercase().contains("chunked"),
                     "connection"=>close=value.to_ascii_lowercase().contains("close"), _=>{}
@@ -213,7 +252,14 @@ async fn exchange_at(pool: Pool, identity: String, address: &str) -> Result<u16,
             returned: Instant::now(),
         });
     }
-    Ok(status)
+    Ok(Exchange {
+        status,
+        pool_us,
+        connect_us,
+        response_us: response_started.elapsed().as_micros() as u64,
+        service_us,
+        runtime_us,
+    })
 }
 
 struct Observation {
@@ -225,6 +271,8 @@ struct Observation {
     error: Option<ClientError>,
     executor_wait: u64,
     submission_lag: u64,
+    admission_wait: u64,
+    exchange: Option<Exchange>,
 }
 struct Results {
     latency: Histogram,
@@ -241,6 +289,13 @@ struct Results {
     completed: u64,
     error_categories: std::collections::BTreeMap<String, u64>,
     error_examples: Vec<Value>,
+    admission_wait: Histogram,
+    pool_wait: Histogram,
+    connect: Histogram,
+    response: Histogram,
+    service: Histogram,
+    server_runtime: Histogram,
+    slow_examples: Vec<Value>,
 }
 impl Results {
     fn new(clients: usize) -> Self {
@@ -259,6 +314,13 @@ impl Results {
             completed: 0,
             error_categories: Default::default(),
             error_examples: Vec::new(),
+            admission_wait: Histogram::new(),
+            pool_wait: Histogram::new(),
+            connect: Histogram::new(),
+            response: Histogram::new(),
+            service: Histogram::new(),
+            server_runtime: Histogram::new(),
+            slow_examples: Vec::new(),
         }
     }
     fn add(&mut self, r: Observation, deadline: Instant, start: Instant) {
@@ -280,6 +342,25 @@ impl Results {
         self.lag.add(r.lag);
         self.executor_wait.add(r.executor_wait);
         self.submission_lag.add(r.submission_lag);
+        self.admission_wait.add(r.admission_wait);
+        if let Some(exchange) = &r.exchange {
+            self.pool_wait.add(exchange.pool_us);
+            self.connect.add(exchange.connect_us);
+            self.response.add(exchange.response_us);
+            if let Some(us) = exchange.service_us {
+                self.service.add(us);
+            }
+            if let Some(us) = exchange.runtime_us {
+                self.server_runtime.add(us);
+            }
+            if r.latency + r.lag >= 10000 && self.slow_examples.len() < 32 {
+                self.slow_examples.push(json!({"phase_ms":r.end.saturating_duration_since(start).as_millis(),
+                    "latency_us":r.latency,"schedule_lag_us":r.lag,"admission_wait_us":r.admission_wait,
+                    "executor_wait_us":r.executor_wait,"pool_us":exchange.pool_us,"connect_us":exchange.connect_us,
+                    "response_us":exchange.response_us,"server_service_us":exchange.service_us,
+                    "server_runtime_us":exchange.runtime_us}));
+            }
+        }
         self.scheduled_latency.add(r.latency + r.lag);
         if index < 3 {
             self.status_latency[index].add(r.latency);
@@ -295,6 +376,35 @@ impl Results {
         self.completed += u64::from(r.end <= deadline);
     }
 }
+#[derive(Clone, Copy, PartialEq)]
+enum Admission {
+    Drop,
+    Wait,
+}
+#[derive(Clone)]
+struct PhaseSettings {
+    pool: Pool,
+    admission: Admission,
+    address: String,
+}
+
+async fn reserve(
+    permits: Arc<Semaphore>,
+    due: Instant,
+    policy: Admission,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ()> {
+    if policy == Admission::Drop {
+        return permits.try_acquire_owned().map_err(|_| ());
+    }
+    // Arrivals retain their original timestamps. One bounded pending admission
+    // absorbs transient bursts; sustained overload remains visible as lag/loss.
+    tokio::time::timeout_at(due + Duration::from_millis(100), permits.acquire_owned())
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+#[cfg(test)]
 async fn phase(
     seconds: u64,
     rate: u64,
@@ -303,9 +413,52 @@ async fn phase(
     prefix: &str,
     limit: usize,
 ) -> Value {
+    phase_with(
+        seconds,
+        rate,
+        concurrency,
+        clients,
+        prefix,
+        limit,
+        PhaseSettings {
+            pool: new_pool(),
+            admission: Admission::Wait,
+            address: "server:8080".into(),
+        },
+    )
+    .await
+}
+async fn phase_with(
+    seconds: u64,
+    rate: u64,
+    concurrency: usize,
+    clients: usize,
+    prefix: &str,
+    limit: usize,
+    settings: PhaseSettings,
+) -> Value {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);
-    let pool: Pool = new_pool();
+    let wakeup = if number("DIAGNOSTICS", 0) == 1 {
+        Some(tokio::spawn(async move {
+            let mut hist = Histogram::new();
+            let mut events = Vec::new();
+            while Instant::now() + Duration::from_millis(10) < deadline {
+                let due = Instant::now() + Duration::from_millis(10);
+                sleep_until(due).await;
+                let lag = Instant::now().saturating_duration_since(due).as_micros() as u64;
+                hist.add(lag);
+                if lag >= 10000 && events.len() < 32 {
+                    events.push(json!({"phase_ms":start.elapsed().as_millis(),"lag_us":lag}));
+                }
+            }
+            json!({"latency":hist.json(),"events":events})
+        }))
+    } else {
+        None
+    };
+    let pool = settings.pool;
+    let pool_before = pool.json();
     let permits = Arc::new(Semaphore::new(concurrency));
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -316,6 +469,7 @@ async fn phase(
     let mut tasks = JoinSet::new();
     let mut results = Results::new(clients);
     let (mut late, mut capacity) = (0, 0);
+    let mut capacity_events = Vec::new();
     let scheduled = seconds * rate;
     for i in 0..scheduled {
         let due = start + Duration::from_secs_f64(i as f64 / rate as f64);
@@ -334,11 +488,19 @@ async fn phase(
             late += 1;
             continue;
         }
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
+        let admission_started = Instant::now();
+        let Ok(permit) = reserve(permits.clone(), due, settings.admission).await else {
             peak_reserved = concurrency;
             capacity += 1;
+            if capacity_events.len() < 32 {
+                capacity_events.push(json!({"phase_ms":start.elapsed().as_millis(),
+                    "schedule_lag_us":Instant::now().saturating_duration_since(due).as_micros(),
+                    "active":active.load(Ordering::Relaxed),"queued":queued.load(Ordering::Relaxed),
+                    "reserved":concurrency-permits.available_permits()}));
+            }
             continue;
         };
+        let admission_wait = admission_started.elapsed().as_micros() as u64;
         let submitted = Instant::now();
         let ms = submitted.saturating_duration_since(start).as_millis();
         if ms != bin_ms {
@@ -354,21 +516,22 @@ async fn phase(
         let (pool, active, peak) = (pool.clone(), active.clone(), peak.clone());
         let client = i as usize % clients;
         let identity = format!("{prefix}-{client}");
+        let address = settings.address.clone();
         tasks.spawn(async move {
             let _permit = permit;
             let begin = Instant::now();
             queued.fetch_sub(1, Ordering::Relaxed);
             let current = active.fetch_add(1, Ordering::Relaxed) + 1;
             peak.fetch_max(current, Ordering::Relaxed);
-            let (status, error) = match tokio::time::timeout(
+            let (status, error, exchange) = match tokio::time::timeout(
                 Duration::from_secs(3),
-                exchange(pool, identity),
+                exchange_observed(pool, identity, &address),
             )
             .await
             {
-                Ok(Ok(status)) => (status, None),
-                Ok(Err(error)) => (0, Some(error)),
-                Err(_) => (0, Some(ClientError::protocol("request", "timeout"))),
+                Ok(Ok(exchange)) => (exchange.status, None, Some(exchange)),
+                Ok(Err(error)) => (0, Some(error), None),
+                Err(_) => (0, Some(ClientError::protocol("request", "timeout")), None),
             };
             let end = Instant::now();
             active.fetch_sub(1, Ordering::Relaxed);
@@ -381,11 +544,13 @@ async fn phase(
                 error,
                 executor_wait: begin.saturating_duration_since(submitted).as_micros() as u64,
                 submission_lag: submitted.saturating_duration_since(due).as_micros() as u64,
+                admission_wait,
+                exchange,
             }
         });
         dispatched += 1;
         // Let ready socket tasks run during catch-up, instead of reserving the whole cap.
-        if dispatched % QUEUED_TASK_LIMIT == 0 {
+        if dispatched.is_multiple_of(QUEUED_TASK_LIMIT) {
             tokio::task::yield_now().await;
         }
     }
@@ -395,17 +560,34 @@ async fn phase(
     }
     let elapsed = (Instant::now() - start).as_secs_f64().max(seconds as f64);
     let divisor = elapsed.max(0.000001);
+    let mut pool_counts = pool.json();
+    for key in ["created", "reused", "idle_expired", "idle_unusable"] {
+        pool_counts[key] =
+            json!(pool_counts[key].as_u64().unwrap() - pool_before[key].as_u64().unwrap());
+    }
     let mut r = json!({"schema_version":3,"generator":"rust-open-loop","histogram_precision":"upper bounds: 0.01ms to 100ms; 0.1ms to 1s; 1ms thereafter",
         "target_rps":rate,"offered_rps":if seconds>0 {results.count as f64/seconds as f64} else {0.0},"achieved_rps":results.count as f64/divisor,
         "elapsed_seconds":elapsed,"measurement_seconds":seconds,"drain_seconds":(elapsed-seconds as f64).max(0.0),"scheduled":scheduled,"sample_count":results.count,
         "completed_in_window":results.completed,"completion_rps_in_window":if seconds>0 {results.completed as f64/seconds as f64} else {0.0},
         "dropped":late+capacity,"dropped_late":late,"dropped_capacity":capacity,"loadgen_saturated":late+capacity>0,
         "concurrency_limit":concurrency,"peak_in_flight":peak.load(Ordering::Relaxed),"mean_in_flight":results.latency_sum as f64/1e6/divisor,
-        "http_200":results.statuses[0],"http_429":results.statuses[1],"http_503":results.statuses[2],"http_other":results.statuses[3],"errors":results.statuses[4],"error_categories":results.error_categories,"error_examples":results.error_examples,"connection_pool":pool.json(),
+        "http_200":results.statuses[0],"http_429":results.statuses[1],"http_503":results.statuses[2],"http_other":results.statuses[3],"errors":results.statuses[4],"error_categories":results.error_categories,"error_examples":results.error_examples,"connection_pool":pool_counts,
         "http_rps":(results.count-results.statuses[4]) as f64/divisor,"admitted_rps":results.statuses[0] as f64/divisor,
         "max_admissions_per_client":results.admitted.iter().max().unwrap_or(&0),"expected_admissions":results.attempts.iter().map(|n|(*n).min(limit)).sum::<usize>(),
         "clients_observed":results.attempts.iter().filter(|n|**n>0).count(),"dispatch_lag":results.lag.json(),"scheduled_latency":results.scheduled_latency.json(),
         "status_latency":{"200":results.status_latency[0].json(),"429":results.status_latency[1].json(),"503":results.status_latency[2].json()}});
+    let timing = json!({"admission_policy":if settings.admission==Admission::Wait {"wait"} else {"drop"},
+        "admission_wait":results.admission_wait.json(),"pool_wait":results.pool_wait.json(),
+        "connect_latency":results.connect.json(),"response_latency":results.response.json(),
+        "server_service":results.service.json(),"server_runtime":results.server_runtime.json(),
+        "slow_examples":results.slow_examples,"capacity_events":capacity_events});
+    r.as_object_mut()
+        .unwrap()
+        .extend(timing.as_object().unwrap().clone());
+    r["runtime_wakeup"] = match wakeup {
+        Some(task) => task.await.expect("runtime probe panicked"),
+        None => Value::Null,
+    };
     let dispatch = json!({"queued_task_limit":QUEUED_TASK_LIMIT,"peak_reserved_slots":peak_reserved,"peak_queued_tasks":peak_queued,"peak_dispatches_per_1ms_bin":peak_dispatches,"executor_wait":results.executor_wait.json(),"submission_lag":results.submission_lag.json()});
     r.as_object_mut()
         .unwrap()
@@ -425,6 +607,7 @@ fn cgroup() -> Value {
     let mut map = serde_json::Map::new();
     for name in [
         "cpu.stat",
+        "cpu.pressure",
         "memory.current",
         "memory.peak",
         "memory.events",
@@ -484,10 +667,47 @@ async fn main() {
     drop(pool);
     let (warmup, duration) = (number("WARMUP", 5), number("DURATION", 20));
     assert!(warmup <= 15 && (1..=60).contains(&duration));
-    phase(warmup, rate, concurrency, clients, "warmup", limit).await;
+    let admission = match std::env::var("ADMISSION_POLICY")
+        .as_deref()
+        .unwrap_or("wait")
+    {
+        "wait" => Admission::Wait,
+        "drop" => Admission::Drop,
+        _ => panic!("invalid ADMISSION_POLICY"),
+    };
+    let reuse = number("REUSE_WARMUP_POOL", 1) == 1;
+    let settings = PhaseSettings {
+        pool: new_pool(),
+        admission,
+        address: "server:8080".into(),
+    };
+    phase_with(
+        warmup,
+        rate,
+        concurrency,
+        clients,
+        "warmup",
+        limit,
+        settings.clone(),
+    )
+    .await;
     phase_barrier("measurement_ready");
     let before = cgroup();
-    let mut result = phase(duration, rate, concurrency, clients, "measure", limit).await;
+    let mut measurement = settings;
+    if !reuse {
+        measurement.pool = new_pool();
+    }
+    let mut result = phase_with(
+        duration,
+        rate,
+        concurrency,
+        clients,
+        "measure",
+        limit,
+        measurement,
+    )
+    .await;
+    result["reuse_warmup_pool"] = json!(reuse);
     result["loadgen_cgroup_before"] = before;
     result["loadgen_cgroup"] = cgroup();
     phase_barrier("measurement_complete");
@@ -496,6 +716,117 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn bounded_admission_wait_preserves_the_original_deadline() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.clone().acquire_owned().await.unwrap();
+        let due = Instant::now();
+        assert!(
+            reserve(permits.clone(), due, Admission::Drop)
+                .await
+                .is_err()
+        );
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        });
+        let acquired = reserve(permits.clone(), due, Admission::Wait)
+            .await
+            .unwrap();
+        assert!(due.elapsed() >= Duration::from_millis(15));
+        assert!(
+            reserve(permits, due - Duration::from_millis(200), Admission::Wait)
+                .await
+                .is_err()
+        );
+        drop(acquired);
+        release.await.unwrap();
+    }
+
+    async fn responding_server(delay_first: bool) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = BufReader::new(stream);
+            let mut first = true;
+            loop {
+                loop {
+                    let mut line = String::new();
+                    if connection.read_line(&mut line).await.unwrap() == 0 {
+                        return;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if first && delay_first {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                first = false;
+                connection
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-bench-service-us: 7\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn transient_stall_is_queued_without_hiding_latency_or_losing_arrivals() {
+        for admission in [Admission::Drop, Admission::Wait] {
+            let (address, server) = responding_server(true).await;
+            let result = phase_with(
+                1,
+                100,
+                1,
+                1,
+                "measure",
+                1000,
+                PhaseSettings {
+                    pool: new_pool(),
+                    admission,
+                    address,
+                },
+            )
+            .await;
+            assert_eq!(result["scheduled"], 100);
+            assert_eq!(
+                result["sample_count"].as_u64().unwrap() + result["dropped"].as_u64().unwrap(),
+                100
+            );
+            assert!(result["scheduled_latency"]["max_ms"].as_f64().unwrap() >= 25.0);
+            if admission == Admission::Wait {
+                assert_eq!(result["dropped"], 0);
+                assert!(result["admission_wait"]["max_ms"].as_f64().unwrap() >= 10.0);
+            } else {
+                assert!(result["dropped_capacity"].as_u64().unwrap() > 0);
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_connections_are_reused_with_separate_phase_counters() {
+        let (address, server) = responding_server(false).await;
+        let settings = PhaseSettings {
+            pool: new_pool(),
+            admission: Admission::Wait,
+            address,
+        };
+        let warmup = phase_with(1, 20, 1, 1, "warmup", 1000, settings.clone()).await;
+        let measured = phase_with(1, 20, 1, 1, "measure", 1000, settings).await;
+        assert_eq!(warmup["connection_pool"]["created"], 1);
+        assert_eq!(measured["connection_pool"]["created"], 0);
+        assert_eq!(measured["connection_pool"]["reused"], 20);
+        assert_eq!(measured["server_service"]["samples"], 20);
+        server.abort();
+        let _ = server.await;
+    }
     #[test]
     fn histogram_bounds_are_conservative_and_bounded() {
         let mut h = Histogram::new();
@@ -657,6 +988,8 @@ mod tests {
                     error: Some(ClientError::protocol("read_status", "eof")),
                     executor_wait: 0,
                     submission_lag: 0,
+                    admission_wait: 0,
+                    exchange: None,
                 },
                 start,
                 start,

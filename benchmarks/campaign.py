@@ -16,6 +16,7 @@ import capacity
 import workloads
 import highlights
 import recovery
+import comparison
 
 HERE=Path(__file__).resolve().parent
 PEERS=['baseline','head','governor','ratelimit']
@@ -70,6 +71,7 @@ def collect(output, children, check=False):
     plan=json.loads((output/'campaign-plan.json').read_text()) if (output/'campaign-plan.json').exists() else {}
     qualification=highlights.confirmation_coverage(result['rounds'],plan.get('requested_cases',()),plan.get('backend'))
     (output/'qualification.json').write_text(json.dumps(qualification,indent=2))
+    (output/'comparison.json').write_text(json.dumps(comparison.scorecard(result['rounds']),indent=2))
     conclusions=verdicts.analyze(rows)
     (output/'verdicts.json').write_text(json.dumps(conclusions,indent=2))
     (output/'report.md').write_text(report.markdown(result)+'\n'+verdicts.markdown(conclusions))

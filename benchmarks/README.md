@@ -107,6 +107,39 @@ retain the original measurement commit and raw data, and record the new report
 generator commit separately. This is useful when a report bug is fixed after a
 long campaign. Report-only runs do not cancel active measurement runs.
 
+## Queue diagnostics and client method
+
+Select `suite=diagnose` and either or both backends to run controlled single-client
+allow experiments at 35k Memory / 20k Redis RPS. The same runner and images run
+baseline and HEAD with three profiles: legacy drop/cold pool, drop/warm pool, and
+bounded admission/warm pool. Each uses three 30-second repetitions and 2-second
+warmup. Diagnostic response headers and runtime probes are enabled for all peers
+in this suite, so these measurements are separate from formal uninstrumented
+performance comparisons. `diagnosis.json` and the overview summarize each profile.
+
+The native generator now reuses HTTP connections from warmup while preserving
+separate client identities and per-phase counters. One pending admission can wait
+for a concurrency slot until 100 ms after its original scheduled arrival. Due
+times and total intended arrivals never change: waiting contributes to scheduled
+latency, expiry remains a dropped request, and sustained overload still fails the
+existing latency/completion/no-drop gates. The 512-slot ceiling is unchanged;
+written requests are never replayed. CLI `--admission-policy drop` and `--cold-pool`
+retain the former behavior for controlled experiments.
+
+New histograms expose p99.9, p99.99 and exact maximum as well as p99. Bounded slow
+request examples and drop events locate admission, executor, connection-pool,
+connect, response and server-service delays. Diagnostic-only wakeup probes help
+separate runtime scheduling from handler/middleware/Redis waits. Host CPU/pressure
+snapshots and container throttling counters remain supporting evidence, not proof
+of a specific cause. Historical and new admission/pool/instrumentation profiles
+are never pooled into one comparison.
+
+Product scorecards show every recorded repeat, achieved RPS, request p99, server
+CPU and response mix at a common offered load. CPU/HEAD ratios require qualified
+matched workloads; the separate paired intervals retain statistical/noise gates.
+The scorecard provides readable observations even when no statistical winner is
+established. Failed repeats and semantically different mixes remain visible.
+
 ## Resource isolation and request accounting
 
 Native Rust generator: **2 CPUs / 512 MiB**, server: **1 CPU / 1 GiB**, Redis:
