@@ -437,26 +437,7 @@ async fn phase_with(
     limit: usize,
     settings: PhaseSettings,
 ) -> Value {
-    let start = Instant::now();
-    let deadline = start + Duration::from_secs(seconds);
-    let wakeup = if number("DIAGNOSTICS", 0) == 1 {
-        Some(tokio::spawn(async move {
-            let mut hist = Histogram::new();
-            let mut events = Vec::new();
-            while Instant::now() + Duration::from_millis(10) < deadline {
-                let due = Instant::now() + Duration::from_millis(10);
-                sleep_until(due).await;
-                let lag = Instant::now().saturating_duration_since(due).as_micros() as u64;
-                hist.add(lag);
-                if lag >= 10000 && events.len() < 32 {
-                    events.push(json!({"phase_ms":start.elapsed().as_millis(),"lag_us":lag}));
-                }
-            }
-            json!({"latency":hist.json(),"events":events})
-        }))
-    } else {
-        None
-    };
+    let setup_started = Instant::now();
     let pool = settings.pool;
     let pool_before = pool.json();
     let permits = Arc::new(Semaphore::new(concurrency));
@@ -471,6 +452,26 @@ async fn phase_with(
     let (mut late, mut capacity) = (0, 0);
     let mut capacity_events = Vec::new();
     let scheduled = seconds * rate;
+    let probe_hist = (number("DIAGNOSTICS", 0) == 1).then(Histogram::new);
+    // No arrivals are scheduled until histogram/counter allocation is complete.
+    let setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(seconds);
+    let wakeup = probe_hist.map(|mut hist| {
+        tokio::spawn(async move {
+            let mut events = Vec::new();
+            while Instant::now() + Duration::from_millis(10) < deadline {
+                let due = Instant::now() + Duration::from_millis(10);
+                sleep_until(due).await;
+                let lag = Instant::now().saturating_duration_since(due).as_micros() as u64;
+                hist.add(lag);
+                if lag >= 10000 && events.len() < 32 {
+                    events.push(json!({"phase_ms":start.elapsed().as_millis(),"lag_us":lag}));
+                }
+            }
+            json!({"latency":hist.json(),"events":events})
+        })
+    });
     for i in 0..scheduled {
         let due = start + Duration::from_secs_f64(i as f64 / rate as f64);
         sleep_until(due).await;
@@ -584,6 +585,7 @@ async fn phase_with(
     r.as_object_mut()
         .unwrap()
         .extend(timing.as_object().unwrap().clone());
+    r["setup_ms"] = json!(setup_ms);
     r["runtime_wakeup"] = match wakeup {
         Some(task) => task.await.expect("runtime probe panicked"),
         None => Value::Null,

@@ -117,6 +117,8 @@ warmup. Diagnostic response headers and runtime probes are enabled for all peers
 in this suite, so these measurements are separate from formal uninstrumented
 performance comparisons. `diagnosis.json` and the overview summarize each profile.
 
+The measurement arrival epoch starts after histogram/counter setup (recorded as
+`setup_ms`), so allocation work does not create a fictitious initial backlog.
 The native generator now reuses HTTP connections from warmup while preserving
 separate client identities and per-phase counters. One pending admission can wait
 for a concurrency slot until 100 ms after its original scheduled arrival. Due
