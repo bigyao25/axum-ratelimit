@@ -49,8 +49,10 @@ jobs:
         run: |
           test -f Cargo.lock
           test -f benchmarks/Cargo.lock
+          test -f benchmarks/native-loadgen/Cargo.lock
           cargo fetch --locked
           cargo fetch --locked --manifest-path benchmarks/Cargo.toml
+          cargo fetch --locked --manifest-path benchmarks/native-loadgen/Cargo.toml
       - run: cargo deny --all-features --locked check
 
   secrets:

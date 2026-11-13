@@ -9,3 +9,5 @@ __pycache__/
 *.log
 
 benchmarks/docker-bin/
+/benchmarks/native-loadgen/target/
+/benchmarks/results.lock

@@ -57,7 +57,7 @@ jobs:
       - name: Real releases require committed lockfiles
         if: ${{ !inputs.dry_run }}
         run: |
-          git ls-files --error-unmatch Cargo.lock benchmarks/Cargo.lock
+          git ls-files --error-unmatch Cargo.lock benchmarks/Cargo.lock benchmarks/native-loadgen/Cargo.lock
           test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify exact requested version

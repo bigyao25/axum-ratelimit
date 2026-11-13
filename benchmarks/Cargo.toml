@@ -11,5 +11,7 @@ publish = false
 axum-ratelimit = { path = ".." }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 http = "1"
+dashmap = "=6.2.1"
+ratelimit = "=2.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tower_governor = { version = "=0.8.0", default-features = false, features = ["axum"] }

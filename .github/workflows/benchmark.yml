@@ -1,108 +1,104 @@
-name: Axum Performance Benchmarks
+name: Axum High-load Benchmarks
 on:
   workflow_dispatch:
     inputs:
       suite:
-        type: choice
-        description: Comparison, operational smoke, or in-process microbenchmarks
-        options: [compare, smoke, micro]
+        description: 'High-load comparison (4 CPUs), operational smoke, or microbenchmarks'
+        required: true
         default: compare
+        type: choice
+        options: [compare, smoke, micro]
       full_matrix:
+        description: 'Run all nine client/mode combinations instead of five representative cases'
+        required: false
+        default: true
         type: boolean
-        description: All nine client-count/mode combinations
-        default: false
-      duration:
-        type: string
-        description: Seconds per sample (1-120)
-        default: '10'
-      repeats:
-        type: string
-        description: Independent repetitions (1-10)
-        default: '3'
 permissions:
   contents: read
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - run: python3 -W error::ResourceWarning -m unittest discover -s benchmarks/tests -v
-      - name: Verify committed lockfiles
-        run: |
-          test -f Cargo.lock
-          test -f benchmarks/Cargo.lock
-          cargo fetch --locked
-          cargo fetch --locked --manifest-path benchmarks/Cargo.toml
-
+      - name: Test benchmark tooling once
+        run: python3 -W error::ResourceWarning -m unittest discover -s benchmarks/tests -v
+      - name: Plan backend shards
+        id: matrix
+        env:
+          BENCHMARK_SUITE: ${{ inputs.suite }}
+        run: python3 benchmarks/workflow.py plan --suite "$BENCHMARK_SUITE" --github-output
   benchmark:
     if: inputs.suite != 'micro'
+    name: Benchmark (${{ matrix.shard }})
     needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.full_matrix && 240 || 180 }}
     strategy:
       fail-fast: false
       max-parallel: 2
-      matrix:
-        backend: [memory, redis]
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: benchmarks -> target
-      - name: Build native Axum comparison server
-        run: |
-          sudo apt-get update && sudo apt-get install -y wrk
-          cargo build --locked --release --manifest-path benchmarks/Cargo.toml
-          mkdir -p benchmarks/docker-bin
-          cp benchmarks/target/release/axum-ratelimit-benchmark benchmarks/docker-bin/benchmark-server
-          docker build -f benchmarks/Dockerfile -t axum-ratelimit-benchmark:local .
-      - name: Run independent resource-bounded measurements
+          fetch-depth: 0
+      - name: Build, probe and confirm on the same runner
+        id: benchmark
         env:
-          SUITE: ${{ inputs.suite }}
-          FULL_MATRIX: ${{ inputs.full_matrix }}
-          DURATION: ${{ inputs.duration }}
-          REPEATS: ${{ inputs.repeats }}
-          BACKEND: ${{ matrix.backend }}
-        shell: bash
+          BENCHMARK_SUITE: ${{ inputs.suite }}
+          BENCHMARK_BACKENDS: ${{ matrix.backends }}
+          BENCHMARK_FULL_MATRIX: ${{ inputs.full_matrix }}
         run: |
-          set -euo pipefail
           mkdir -p benchmarks/results/ci
-          options=()
-          if [ "$FULL_MATRIX" = true ]; then options+=(--full-matrix); fi
-          python3 benchmarks/harness.py --backend "$BACKEND" --suite "$SUITE" \
-            --duration "$DURATION" --repeats "$REPEATS" "${options[@]}" \
-            --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
-      - name: Publish assessment without hiding failures
-        if: always()
-        shell: bash
-        run: |
-          if [ -f benchmarks/results/ci/assessment.md ]; then
-            cat benchmarks/results/ci/assessment.md >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if [ "$BENCHMARK_SUITE" = compare ]; then
+            options=()
+            if [ "$BENCHMARK_FULL_MATRIX" = true ]; then options+=(--full-matrix); fi
+            python3 benchmarks/campaign.py --backend "$BENCHMARK_BACKENDS" "${options[@]}" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+            exit 0
           else
-            echo 'Benchmark did not produce measurements. Inspect build/run logs; no performance conclusion is available.' >> "$GITHUB_STEP_SUMMARY"
+            resource=ci
+            variants=(baseline head governor ratelimit)
+            backends=(memory redis)
           fi
-      - uses: actions/upload-artifact@v7
+          python3 benchmarks/bench.py "$BENCHMARK_SUITE" --resources "$resource" --variants "${variants[@]}" --backends "${backends[@]}" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+      - name: Record shard outcome
         if: always()
+        env:
+          BENCHMARK_STATUS: ${{ steps.benchmark.outcome }}
+        run: python3 benchmarks/workflow.py status benchmarks/results/ci --outcome "$BENCHMARK_STATUS"
+      - name: Generate assessment even on failure
+        if: always()
+        env:
+          BENCHMARK_STATUS: ${{ steps.benchmark.outcome }}
+        run: python3 benchmarks/summary.py benchmarks/results/ci --status "$BENCHMARK_STATUS" --output benchmarks/results/ci/assessment.md
+      - name: Upload reports and raw diagnostics
+        id: artifact
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: benchmark-diagnostics-${{ matrix.backend }}
+          name: benchmark-diagnostics-${{ matrix.shard }}
           path: benchmarks/results/ci/
-          if-no-files-found: warn
           retention-days: 14
-
+          if-no-files-found: warn
+      - name: Publish workflow assessment
+        if: always()
+        env:
+          BENCHMARK_STATUS: ${{ steps.benchmark.outcome }}
+          BENCHMARK_ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: python3 benchmarks/summary.py benchmarks/results/ci --status "$BENCHMARK_STATUS" --output benchmarks/results/ci/assessment.md --github-summary
   micro:
     if: inputs.suite == 'micro'
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -110,11 +106,10 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run memory and middleware microbenchmarks explicitly
-        shell: bash
+      - name: Run explicit in-process microbenchmarks
         run: |
-          set -euo pipefail
           mkdir -p benchmarks/results/micro
+          set -euo pipefail
           cargo bench --locked --no-default-features --bench memory 2>&1 | tee benchmarks/results/micro/memory.log
           cargo bench --locked --no-default-features --bench middleware 2>&1 | tee benchmarks/results/micro/middleware.log
       - uses: actions/upload-artifact@v7
@@ -122,11 +117,12 @@ jobs:
         with:
           name: benchmark-micro
           path: benchmarks/results/micro/
-
+          retention-days: 14
   overview:
-    if: ${{ always() && needs.prepare.result == 'success' && inputs.suite != 'micro' }}
+    name: Collect backend reports
     needs: [prepare, benchmark]
-    runs-on: ubuntu-24.04
+    if: ${{ always() && needs.prepare.result == 'success' && inputs.suite != 'micro' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -136,10 +132,16 @@ jobs:
         with:
           pattern: benchmark-diagnostics-*
           path: benchmarks/results/shards
-      - name: Collect backend reports without averaging unlike workloads
-        run: python3 benchmarks/overview.py benchmarks/results/shards
-      - uses: actions/upload-artifact@v7
+          merge-multiple: false
+      - name: Index independent measurements
         if: always()
+        env:
+          BENCHMARK_SUITE: ${{ inputs.suite }}
+        run: python3 benchmarks/workflow.py aggregate benchmarks/results/shards --suite "$BENCHMARK_SUITE" --output benchmarks/results/overview --github-summary
+      - name: Upload workflow overview
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-overview
-          path: benchmarks/results/overview.md
+          path: benchmarks/results/overview/
+          retention-days: 14

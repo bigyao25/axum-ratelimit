@@ -113,7 +113,9 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "axum-ratelimit",
+ "dashmap",
  "http",
+ "ratelimit",
  "tokio",
  "tower_governor",
 ]
@@ -790,6 +792,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom",
+]
+
+[[package]]
+name = "ratelimit"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e78b08065c51c82ff8c4a0d88e3dce3edfce39c375e946c3464210fff3433fb8"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -34,12 +34,13 @@ def main() -> int:
     if not shutil.which("cargo"):
         print("ERROR: cargo unavailable. Rust validation NOT run.", file=sys.stderr)
         return 2
-    for lock in ("Cargo.lock", "benchmarks/Cargo.lock"):
+    for lock in ("Cargo.lock", "benchmarks/Cargo.lock", "benchmarks/native-loadgen/Cargo.lock"):
         if not (ROOT / lock).is_file():
             print(f"ERROR: required lockfile {lock} is missing; restore it from version control.", file=sys.stderr)
             return 2
     run("cargo", "fmt", "--all", "--", "--check")
     run("cargo", "fmt", "--manifest-path", "benchmarks/Cargo.toml", "--all", "--", "--check")
+    run("cargo", "fmt", "--manifest-path", "benchmarks/native-loadgen/Cargo.toml", "--all", "--", "--check")
     for flags in ([], ["--no-default-features"]):
         run("cargo", "clippy", "--locked", "--all-targets", *flags, "--", "-D", "warnings")
         run("cargo", "test", "--locked", "--lib", "--tests", "--examples", *flags)
@@ -47,7 +48,8 @@ def main() -> int:
         run("cargo", "doc", "--locked", "--no-deps", *flags,
             env={**os.environ, "RUSTDOCFLAGS": "-D warnings"})
     run("cargo", "check", "--locked", "--benches", "--all-features")
-    run("cargo", "check", "--locked", "--manifest-path", "benchmarks/Cargo.toml")
+    run("cargo", "test", "--locked", "--manifest-path", "benchmarks/Cargo.toml")
+    run("cargo", "test", "--locked", "--manifest-path", "benchmarks/native-loadgen/Cargo.toml")
     if args.redis:
         if "REDIS_URL" not in os.environ:
             print("ERROR: --redis requires explicit REDIS_URL.", file=sys.stderr)

@@ -10,7 +10,7 @@
 ## Prepare a release
 
 1. Update the version in [Cargo.toml](../Cargo.toml) and the release notes/date in
-   [CHANGELOG.md](../CHANGELOG.md). Keep both Cargo.lock files committed and consistent
+   [CHANGELOG.md](../CHANGELOG.md). Keep all Cargo.lock files committed and consistent
    with their manifests.
 2. Validate locally from the repository root:
 
