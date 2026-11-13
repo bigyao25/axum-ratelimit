@@ -6,6 +6,23 @@ import collections
 MODES=('allow','mixed','reject')
 
 
+def parse_targets(values):
+    """Validate bounded explicit follow-ups without importing prior measurements."""
+    result=[];seen=set()
+    for value in values:
+        try:
+            clients,mode,rate=value.split(':')
+            clients,rate=int(clients),int(rate)
+        except (ValueError, TypeError):
+            raise ValueError('Targets must use CLIENTS:MODE:RPS') from None
+        if clients not in (1,100,10000) or mode not in MODES or not 1000<=rate<=100000:
+            raise ValueError('Targets require clients 1/100/10000, allow/mixed/reject, and 1000..100000 RPS')
+        if (clients,mode) in seen:
+            raise ValueError('Duplicate target workload')
+        seen.add((clients,mode));result.append(dict(clients=clients,mode=mode,rate=rate))
+    return result
+
+
 def cases(full=False):
     pairs=itertools.product((1,100,10000),MODES) if full else (
         (1,'allow'),(100,'allow'),(10000,'allow'),(100,'mixed'),(100,'reject'))

@@ -74,8 +74,17 @@ def probe_bounds(rows, peers):
 
 def next_probe(rows, peers, resolution):
     bounds=probe_bounds(rows,peers)
-    if bounds.get('head',{}).get('non_monotonic'): return None
     seen={r['target_rps'] for r in rows}
+    # Peer bounds deliberately require a passing control. Bootstrap that control
+    # first when every clean baseline probe fails, using the same caller budget.
+    baseline=bounds.get('baseline',{})
+    if baseline.get('lower') is None and baseline.get('upper') is not None:
+        rate=max(1000,round(baseline['upper']/1000)*500)
+        if rate not in seen:
+            return dict(rate=rate,for_variant='baseline',reason='lower baseline range',
+                        previous_bounds=baseline)
+        return None
+    if bounds.get('head',{}).get('non_monotonic'): return None
     for peer in ['head']+[v for v in peers if v not in ('baseline','head')]:
         b=bounds[peer];lo,hi=b['lower'],b['upper']
         if b['non_monotonic']: continue

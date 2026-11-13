@@ -13,10 +13,21 @@ on:
         required: false
         default: true
         type: boolean
+      backends:
+        description: 'Backend shards to run'
+        required: true
+        default: both
+        type: choice
+        options: [both, memory, redis]
+      targets:
+        description: 'Optional single-backend follow-ups: CLIENTS:MODE:RPS separated by spaces'
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
 concurrency:
-  group: benchmark-${{ github.workflow }}-${{ github.ref }}
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}-${{ inputs.backends }}
   cancel-in-progress: true
 jobs:
   prepare:
@@ -34,7 +45,11 @@ jobs:
         id: matrix
         env:
           BENCHMARK_SUITE: ${{ inputs.suite }}
-        run: python3 benchmarks/workflow.py plan --suite "$BENCHMARK_SUITE" --github-output
+          BENCHMARK_SELECTION: ${{ inputs.backends }}
+          BENCHMARK_TARGETS: ${{ inputs.targets }}
+        run: |
+          read -r -a targets <<< "$BENCHMARK_TARGETS"
+          python3 benchmarks/workflow.py plan --suite "$BENCHMARK_SUITE" --backends "$BENCHMARK_SELECTION" --targets "${targets[@]}" --github-output
   benchmark:
     if: inputs.suite != 'micro'
     name: Benchmark (${{ matrix.shard }})
@@ -56,18 +71,24 @@ jobs:
           BENCHMARK_SUITE: ${{ inputs.suite }}
           BENCHMARK_BACKENDS: ${{ matrix.backends }}
           BENCHMARK_FULL_MATRIX: ${{ inputs.full_matrix }}
+          BENCHMARK_TARGETS: ${{ inputs.targets }}
         run: |
           mkdir -p benchmarks/results/ci
           set -euo pipefail
           if [ "$BENCHMARK_SUITE" = compare ]; then
             options=()
-            if [ "$BENCHMARK_FULL_MATRIX" = true ]; then options+=(--full-matrix); fi
+            if [ -n "$BENCHMARK_TARGETS" ]; then
+              read -r -a targets <<< "$BENCHMARK_TARGETS"
+              options+=(--targets "${targets[@]}")
+            elif [ "$BENCHMARK_FULL_MATRIX" = true ]; then
+              options+=(--full-matrix)
+            fi
             python3 benchmarks/campaign.py --backend "$BENCHMARK_BACKENDS" "${options[@]}" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
             exit 0
           else
             resource=ci
             variants=(baseline head governor ratelimit)
-            backends=(memory redis)
+            read -r -a backends <<< "$BENCHMARK_BACKENDS"
           fi
           python3 benchmarks/bench.py "$BENCHMARK_SUITE" --resources "$resource" --variants "${variants[@]}" --backends "${backends[@]}" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
       - name: Record shard outcome
@@ -137,7 +158,8 @@ jobs:
         if: always()
         env:
           BENCHMARK_SUITE: ${{ inputs.suite }}
-        run: python3 benchmarks/workflow.py aggregate benchmarks/results/shards --suite "$BENCHMARK_SUITE" --output benchmarks/results/overview --github-summary
+          BENCHMARK_SELECTION: ${{ inputs.backends }}
+        run: python3 benchmarks/workflow.py aggregate benchmarks/results/shards --suite "$BENCHMARK_SUITE" --backends "$BENCHMARK_SELECTION" --output benchmarks/results/overview --github-summary
       - name: Upload workflow overview
         if: always()
         uses: actions/upload-artifact@v7

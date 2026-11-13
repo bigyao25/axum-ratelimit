@@ -59,7 +59,8 @@ class RecoveryTest(unittest.TestCase):
     def test_rate_reduction_is_bounded(self):
         self.assertEqual(recovery.lower_rate(49000),39000)
         self.assertEqual(recovery.lower_rate(39000),31000)
-        self.assertIsNone(recovery.lower_rate(5000))
+        self.assertEqual(recovery.lower_rate(5000),4000)
+        self.assertIsNone(recovery.lower_rate(1000))
 
 
 class RecoveryCampaignTest(unittest.TestCase):

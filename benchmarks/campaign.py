@@ -67,6 +67,9 @@ def collect(output, children, check=False):
         (output/'environment.json').write_text(json.dumps(env,indent=2))
     result=report.summarize(dict(rounds=rows))
     (output/'validated.json').write_text(json.dumps(result,indent=2))
+    plan=json.loads((output/'campaign-plan.json').read_text()) if (output/'campaign-plan.json').exists() else {}
+    qualification=highlights.confirmation_coverage(result['rounds'],plan.get('requested_cases',()),plan.get('backend'))
+    (output/'qualification.json').write_text(json.dumps(qualification,indent=2))
     conclusions=verdicts.analyze(rows)
     (output/'verdicts.json').write_text(json.dumps(conclusions,indent=2))
     (output/'report.md').write_text(report.markdown(result)+'\n'+verdicts.markdown(conclusions))
@@ -83,6 +86,8 @@ def main():
     p.add_argument('--full-matrix',action='store_true',help='Use all nine client/mode combinations instead of five representative cases')
     p.add_argument('--resolution',type=int,help='Stop refining once pass/fail gap is within this many RPS')
     p.add_argument('--refine-budget',type=int,default=3,help='Maximum additional short rate probes (0..6)')
+    p.add_argument('--targets',nargs='+',metavar='CLIENTS:MODE:RPS',
+                   help='Explicit follow-up workloads; fresh baseline/HEAD surveys and full confirmations, no capacity search')
     p.add_argument('--plan',action='store_true')
     a=p.parse_args()
     rates=sorted(set(a.probe_rates or ([15000] if a.check else PROBES[a.backend])))
@@ -94,17 +99,25 @@ def main():
     peers=[v for v in PEERS if variants.supports(v,a.backend,'allow')]
     if a.check: peers=['baseline','head'];rates=rates[:1]
     probe_seconds,warmup,seconds,repeats=(2,1,2,1) if a.check else (5,5,30,5)
-    cases=workloads.cases(a.full_matrix)
+    try:
+        cases=workloads.parse_targets(a.targets) if a.targets else workloads.cases(a.full_matrix)
+    except ValueError as error:
+        p.error(str(error))
+    if a.targets and (a.check or a.probe_rates or a.full_matrix):
+        p.error('--targets cannot be combined with --check, --probe-rates or --full-matrix')
     if a.plan:
-        calibration_rounds=0 if a.check else capacity.LOADGEN_STEPS
-        short_rounds=(len(rates)+(0 if a.check else a.refine_budget)+2*(len(cases)-1))*len(peers)+calibration_rounds
-        print(json.dumps(dict(backend=a.backend,variants=peers,probe_rates=rates,
+        calibration_rounds=0 if a.check or a.targets else capacity.LOADGEN_STEPS
+        short_rounds=(2*len(cases)*len(peers) if a.targets else
+                      (len(rates)+(0 if a.check else a.refine_budget)+2*(len(cases)-1))*len(peers)+calibration_rounds)
+        confirmation_cells=len(cases) if a.targets else len(cases)+1
+        print(json.dumps(dict(backend=a.backend,variants=peers,probe_rates=[] if a.targets else rates,
+                             scope='targeted' if a.targets else 'matrix',
                              operational_check=a.check,probe_seconds=probe_seconds,probe_warmup=1 if a.check else 2,confirmation_seconds=seconds,
                              confirmation_warmup=warmup,confirmation_repeats=repeats,
-                             cases=cases,resolution_rps=resolution,refinement_budget=0 if a.check else a.refine_budget,
+                             cases=cases,resolution_rps=resolution,refinement_budget=0 if a.check or a.targets else a.refine_budget,
                              calibration_probes=calibration_rounds,loadgen_headroom=capacity.LOADGEN_HEADROOM,
-                             max_confirmation_rounds=(len(cases)+1)*len(peers)*repeats,
-                             max_confirmation_load_seconds=(len(cases)+1)*len(peers)*repeats*(seconds+warmup),
+                             max_confirmation_rounds=confirmation_cells*len(peers)*repeats,
+                             max_confirmation_load_seconds=confirmation_cells*len(peers)*repeats*(seconds+warmup),
                              max_short_rounds=short_rounds,
                              recovery=dict(max_downshifts=0 if a.check else 2,factor=.8,
                                            preflight_repeats=0 if a.check else 1,
@@ -124,7 +137,8 @@ def main():
         (a.output/'campaign-plan.json').write_text(json.dumps(dict(
             confirmations=plan,refinement_trace=trace,resolution_rps=resolution,
             coverage_cases=coverage,issues=issues,environment_recoveries=environment_recoveries,
-            environment_unresolved=environment_unresolved,**details),indent=2))
+            environment_unresolved=environment_unresolved,**details) |
+            dict(backend=a.backend,scope='targeted' if a.targets else 'matrix',requested_cases=cases),indent=2))
 
     def execute(name,stage,selected,levels,duration,prewarm,repetitions,
                 clients=1,mode='allow',record=True):
@@ -203,55 +217,59 @@ def main():
         return confirmed
 
     try:
-        calibration=dict(initial=list(rates),steps=[],adjusted=False)
-        if not a.check and a.probe_rates is None:
-            for step in range(capacity.LOADGEN_STEPS):
-                observed=probe_quietly('calibrate-'+str(step),[rates[-1]])
-                decision=capacity.ladder_step(rates,observed,resolution)
-                calibration['steps'].append(decision or dict(rate=rates[-1],pressure=False))
-                if decision is None: break
-                rates=decision['rates']
-        calibration['final']=list(rates)
-        calibration['adjusted']=rates!=calibration['initial']
-        anchor=[]
-        for rate in rates:
-            anchor+=probe_quietly('probe-'+str(rate),[rate],record=True)
-        for i in range(0 if a.check else a.refine_budget):
-            decision=capacity.next_probe(anchor,peers,resolution) if anchor else None
-            if decision is None: break
-            trace.append(decision)
-            anchor+=probe_quietly('refine-'+str(i),[decision['rate']],record=True)
-        collect(a.output,children,a.check)
-        plan,details=confirmation_plan(anchor,a.backend,peers)
-        details['calibration']=calibration
-        details['search_status']=capacity.search_status(anchor,peers,resolution,len(trace),
-                                                        0 if a.check else a.refine_budget,a.check)
         save_plan()
-        probe_loss=any(entry.get('source_run','').startswith(('probe-','refine-'))
-                       for entry in environment_recoveries)
-        if not plan and not probe_loss:
-            raise RuntimeError('No confirmation plan: inspect probe diagnostics')
-        if not plan:
-            environment_unresolved.append(dict(source_run='probe',rate=max(rates),
-                reason='no reliable HEAD/baseline probe bracket after generator loss'))
+        rate=None
+        if not a.targets:
+            calibration=dict(initial=list(rates),steps=[],adjusted=False)
+            if not a.check and a.probe_rates is None:
+                for step in range(capacity.LOADGEN_STEPS):
+                    observed=probe_quietly('calibrate-'+str(step),[rates[-1]])
+                    decision=capacity.ladder_step(rates,observed,resolution)
+                    calibration['steps'].append(decision or dict(rate=rates[-1],pressure=False))
+                    if decision is None: break
+                    rates=decision['rates']
+            calibration['final']=list(rates)
+            calibration['adjusted']=rates!=calibration['initial']
+            anchor=[]
+            for rate in rates:
+                anchor+=probe_quietly('probe-'+str(rate),[rate],record=True)
+            for i in range(0 if a.check else a.refine_budget):
+                decision=capacity.next_probe(anchor,peers,resolution) if anchor else None
+                if decision is None: break
+                trace.append(decision)
+                anchor+=probe_quietly('refine-'+str(i),[decision['rate']],record=True)
+            collect(a.output,children,a.check)
+            plan,details=confirmation_plan(anchor,a.backend,peers)
+            details['calibration']=calibration
+            details['search_status']=capacity.search_status(anchor,peers,resolution,len(trace),
+                                                            0 if a.check else a.refine_budget,a.check)
             save_plan()
-        else:
-            confirmed_rates=set()
-            for cell in plan:
-                intended=cell['rate']
-                if intended in confirmed_rates:
-                    continue
-                actual=confirm_with_recovery('confirm-'+str(intended),intended,cell['variants'])
-                if actual is not None: confirmed_rates.add(actual)
-            # Compare cardinality and response paths at one conservative shared level.
-            reference=details['common_probe_rate'] or min(details['probe_candidates'].values())
-            if confirmed_rates:
-                reference=min(reference,max(confirmed_rates))
-            rate=max(5000,round(reference*.8/500)*500) if not a.check else rates[0]
+            probe_loss=any(entry.get('source_run','').startswith(('probe-','refine-'))
+                           for entry in environment_recoveries)
+            if not plan and not probe_loss:
+                raise RuntimeError('No confirmation plan: inspect probe diagnostics')
+            if not plan:
+                environment_unresolved.append(dict(source_run='probe',rate=max(rates),
+                    reason='no reliable HEAD/baseline probe bracket after generator loss'))
+                save_plan()
+            else:
+                confirmed_rates=set()
+                for cell in plan:
+                    intended=cell['rate']
+                    if intended in confirmed_rates:
+                        continue
+                    actual=confirm_with_recovery('confirm-'+str(intended),intended,cell['variants'])
+                    if actual is not None: confirmed_rates.add(actual)
+                # Compare cardinality and response paths at one conservative shared level.
+                reference=details['common_probe_rate'] or min(details['probe_candidates'].values())
+                if confirmed_rates:
+                    reference=min(reference,max(confirmed_rates))
+                rate=max(1000,round(reference*.8/500)*500) if not a.check else rates[0]
+        if a.targets or plan:
             for case in cases:
                 clients,mode=case['clients'],case['mode']
-                if clients==1 and mode=='allow': continue
-                offered=rate;name=f'{clients}-{mode}'
+                if not a.targets and clients==1 and mode=='allow': continue
+                offered=case.get('rate',rate);name=f'{clients}-{mode}'
                 observed=[]
                 for attempt in range(2):
                     duration=min(60,max(probe_seconds,math.ceil(clients*10/offered))) if mode=='reject' else probe_seconds
@@ -261,7 +279,8 @@ def main():
                         offered=recovery.lower_rate(offered) or offered
                         continue
                     if all(verdicts.passed(r) for r in observed): break
-                    fallback=max(5000,round(offered/1000)*500)
+                    if attempt==1: break
+                    fallback=max(1000,round(offered/1000)*500)
                     if fallback==offered: break
                     offered=fallback
                 if not observed:
@@ -273,6 +292,7 @@ def main():
                           and not workloads.coverage_failures(r)]
                 skipped=sorted(set(peers)-set(eligible))
                 coverage.append(dict(clients=clients,mode=mode,rate=offered,
+                                     requested_rate=case.get('rate'),
                                      variants=eligible,skipped=skipped))
                 if skipped:
                     issues.append(dict(case=name,reason='Invalid measurement or required response/cardinality coverage missing',variants=skipped))

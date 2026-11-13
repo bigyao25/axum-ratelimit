@@ -47,7 +47,10 @@ The optional representative matrix contains five cases: 1/100/10,000 allow,
    offered RPS with 2-second warmup, 5-second measurement and one repetition.
 2. Refine adjacent passing/failing candidates using at most three extra rates.
    Target gaps are 5k RPS for Memory and 2k for Redis. Reaching the refinement
-   budget does not imply reaching the requested resolution.
+   budget does not imply reaching the requested resolution. If all clean baseline
+   probes fail, halve the lowest failing baseline rate (1k RPS floor) before
+   refining product bounds. These downshifts share the same three-probe budget;
+   invalid measurements never become failing bounds.
 3. Confirm at most HEAD's passing/failing endpoints, always with baseline and all
    compatible peers: **5-second warmup, 30-second measurement, five independent
    repetitions**. Alternate product order across repetitions.
@@ -68,6 +71,35 @@ Builds are reused between phases only after verifying commit, tracked source
 hashes, build settings, image IDs and native architecture. Formal runs require a
 clean committed tree. Bounded scheduler-loss recovery retains failed diagnostics
 and lowers offered rates instead of relaxing correctness or qualification criteria.
+Recovery and scenario fallback use a 1k RPS floor, so a low calibrated range is
+never raised back to 5k RPS.
+
+## Selected backends and targeted follow-ups
+
+The workflow `backends` input selects `both` (default), `memory` or `redis`.
+Separate Memory and Redis workflow runs do not cancel each other. All products
+and repetitions for one backend remain on the same runner.
+
+For a follow-up, select one backend and pass space-separated `targets`, for example
+`1:allow:20000 10000:mixed:15000`. This overrides the full-matrix switch and skips
+capacity search, then runs fresh same-host baseline/HEAD surveys, long preflight
+and all five confirmations for each selected case. Surveys may fall back once;
+generator recovery remains bounded. Reports show the actual tested rate. No
+measurements, passing rates or build manifests are imported from earlier runs.
+Other matrix cells are explicitly labeled as outside this follow-up's scope.
+
+```bash
+python3 benchmarks/campaign.py --backend memory --full-matrix --output benchmarks/results/memory
+python3 benchmarks/campaign.py --backend redis --targets 1:allow:20000 10000:mixed:15000 --output benchmarks/results/redis-followup
+```
+
+The overview separates execution from qualification: every requested scenario
+has a paired confirmation table, including passing/recorded repeat counts for
+HEAD and baseline, unqualified levels and missing cases. `qualification.json`
+contains the same evidence in machine-readable form. Five clean paired repeats
+of at least 30 seconds qualify a level; four passing repeats do not. A successful
+workflow can therefore finish with qualification warnings. Earlier failed
+attempts stay in their original artifacts and are never merged into a new run.
 
 ## Resource isolation and request accounting
 

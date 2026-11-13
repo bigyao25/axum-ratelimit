@@ -56,11 +56,14 @@ def render(folder, status='unknown', artifact_url=''):
     load_failed=[r for r in valid if r['load_failure_reasons']]
     esc=lambda v: str(v).replace('|','\\|').replace('\n',' ').replace('`','').replace('<','&lt;')
     fmt=lambda v: 'N/A' if v is None else f'{v:.2f}'
-    plan=env.get('campaign',{}).get('plan',{})
+    plan_path=folder/'campaign-plan.json'
+    plan=json.loads(plan_path.read_text()) if plan_path.exists() else env.get('campaign',{}).get('plan',{})
     executive=highlights.concise(rows, verdicts.analyze(rows), status,
                                  plan.get('issues', []), artifact_url,
                                  plan.get('environment_recoveries', []),
-                                 plan.get('environment_unresolved', []))
+                                 plan.get('environment_unresolved', []),
+                                 plan.get('requested_cases', []),plan.get('backend'),
+                                 plan.get('scope','matrix'))
     lines=['# Benchmark assessment','',executive,'','---','',
            '## Detailed evidence','',f'Execution status: **{esc(status)}**.',
            f'Completed rounds: **{len(rows)}**; measurement-clean: **{len(valid)}**; other invalid: **{len(unexpected)}**.','']

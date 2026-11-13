@@ -8,20 +8,27 @@ from pathlib import Path
 import report
 import verdicts
 import highlights
+import workloads
 
 
-def matrix(suite):
-    if suite=='compare': return {'include':[{'shard':'memory','backends':'memory'},{'shard':'redis','backends':'redis'}]}
+def matrix(suite, backends='both', targets=()):
+    selected=['memory','redis'] if backends=='both' else [backends]
+    if any(b not in ('memory','redis') for b in selected): raise ValueError('Unknown backend')
+    if targets:
+        workloads.parse_targets(targets)
+        if suite!='compare' or len(selected)!=1:
+            raise ValueError('Targets require compare and one selected backend')
+    if suite=='compare': return {'include':[{'shard':b,'backends':b} for b in selected]}
     if suite=='micro': return {'include':[{'shard':'micro','backends':'memory'}]}
-    if suite=='smoke': return {'include':[{'shard':'smoke','backends':'memory redis'}]}
+    if suite=='smoke': return {'include':[{'shard':'smoke','backends':' '.join(selected)}]}
     raise ValueError('Unknown benchmark suite')
 
 
-def aggregate(root, suite):
+def aggregate(root, suite, backends='both'):
     """One short overview. Detailed round tables stay in shard artifacts."""
     shards=[]
     sections=[]
-    for item in matrix(suite)['include']:
+    for item in matrix(suite,backends)['include']:
         shard=item['shard']
         folder=root/('benchmark-diagnostics-'+shard)
         status=json.loads((folder/'status.json').read_text()) if (folder/'status.json').exists() else {}
@@ -48,6 +55,8 @@ def aggregate(root, suite):
                'load_failure_reasons':report.load_failures(r)} for r in raw['rounds']]
         plan_path=folder/'campaign-plan.json'
         plan=json.loads(plan_path.read_text()) if plan_path.exists() else {}
+        coverage=highlights.confirmation_coverage(rows,plan.get('requested_cases',()),plan.get('backend'))
+        entry['confirmation_coverage']=coverage
         verdict_path=folder/'verdicts.json'
         verdict=json.loads(verdict_path.read_text()) if verdict_path.exists() else verdicts.analyze(rows)
         outcome=semantic or ('completed' if complete else 'measurement_failure')
@@ -56,32 +65,41 @@ def aggregate(root, suite):
         sections += ['## '+shard.capitalize(), '',
                      highlights.concise(rows,verdict,outcome,plan.get('issues',[]),
                                         recoveries=plan.get('environment_recoveries',[]),
-                                        unresolved=plan.get('environment_unresolved',[])),
+                                        unresolved=plan.get('environment_unresolved',[]),
+                                        requested=plan.get('requested_cases',()),backend=plan.get('backend'),
+                                        scope=plan.get('scope','matrix')),
                      'Artifact: `'+folder.name+'`.']
     shas={s['git_sha'] for s in shards if s['git_sha']}
     success=all(s['complete'] for s in shards) and len(shas)==1
     incomplete_evidence=any(x['verification']=='inconclusive_environment' for x in shards)
     status=('Incomplete — inspect failing shard' if not success else
             'Inconclusive — one or more runner-limited shards' if incomplete_evidence else
-            'Complete with warnings' if any(x['verification'] in ('completed_with_environment_limits','completed_with_peer_exclusions') for x in shards)
+            'Complete with warnings' if any(x['verification'] in ('completed_with_environment_limits','completed_with_peer_exclusions')
+                                          or (x['confirmation_coverage']['requested_cases'] and not x['confirmation_coverage']['complete']) for x in shards)
             else 'Complete')
     lines=['# Benchmark results','',f'**Run status:** {status}.',
            'Measurements from different hosted runners are **not combined or ranked**.',
            'Successful execution does not imply a performance winner or maximum throughput.',
            '']+sections
-    return dict(suite=suite,complete=success,shards=shards), '\n'.join(lines)+'\n'
+    return dict(suite=suite,complete=success,
+                qualification_complete=all(x['confirmation_coverage']['complete'] for x in shards),
+                shards=shards), '\n'.join(lines)+'\n'
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     sub=p.add_subparsers(dest='command',required=True)
     plan=sub.add_parser('plan');plan.add_argument('--suite',choices=['compare','smoke','micro'],required=True)
     plan.add_argument('--github-output',action='store_true')
+    plan.add_argument('--backends',choices=['both','memory','redis'],default='both')
+    plan.add_argument('--targets',nargs='*',default=[])
     status=sub.add_parser('status');status.add_argument('folder',type=Path);status.add_argument('--outcome',required=True)
     merge=sub.add_parser('aggregate');merge.add_argument('root',type=Path);merge.add_argument('--suite',choices=['compare','smoke'],required=True)
     merge.add_argument('--output',type=Path,required=True);merge.add_argument('--github-summary',action='store_true')
+    merge.add_argument('--backends',choices=['both','memory','redis'],default='both')
     a=p.parse_args()
     if a.command=='plan':
-        data=json.dumps(matrix(a.suite))
+        try: data=json.dumps(matrix(a.suite,a.backends,a.targets))
+        except ValueError as error: p.error(str(error))
         print(data)
         if a.github_output:
             with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('matrix='+data+'\n')
@@ -89,7 +107,7 @@ def main():
         a.folder.mkdir(parents=True,exist_ok=True)
         (a.folder/'status.json').write_text(json.dumps(dict(outcome=a.outcome),indent=2))
     else:
-        data,content=aggregate(a.root,a.suite)
+        data,content=aggregate(a.root,a.suite,a.backends)
         a.output.mkdir(parents=True,exist_ok=True)
         (a.output/'index.json').write_text(json.dumps(data,indent=2))
         (a.output/'overview.md').write_text(content)

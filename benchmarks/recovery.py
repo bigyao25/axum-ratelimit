@@ -51,8 +51,8 @@ def inspect(rows, expected_repeats, validate, exit_code=0):
 
 
 def lower_rate(rate):
-    """Reduce rate by about 20%, retaining 500-RPS step and a 5k floor."""
-    lower = max(5000, int((rate * 0.8) // 500) * 500)
+    """Reduce rate by about 20%, retaining 500-RPS step and a 1k floor."""
+    lower = max(1000, int((rate * 0.8) // 500) * 500)
     return lower if lower < rate else None
 
 

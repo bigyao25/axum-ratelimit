@@ -64,6 +64,26 @@ class MatrixCoverageTest(unittest.TestCase):
 
 
 class RefinementTest(unittest.TestCase):
+    def test_failed_baseline_bootstraps_a_lower_range_within_the_same_budget(self):
+        peers=['baseline','head','governor','ratelimit']
+        rows=[probe(v,rate,scheduled_latency={'p99_ms':20})
+              for rate in (31000,41000) for v in peers]
+        decision=capacity.next_probe(rows,peers,5000)
+        self.assertEqual((decision['rate'],decision['for_variant']),(15500,'baseline'))
+        self.assertFalse(capacity.probe_bounds(rows,peers)['head']['failing'])
+        rows += [probe(v,15500) for v in peers]
+        self.assertTrue(campaign.confirmation_plan(rows,'memory',peers)[0])
+
+    def test_invalid_baseline_is_not_a_clean_failing_bound(self):
+        for changes in ({'errors':1},{'loadgen_cpu_pct':190}):
+            rows=[probe(v,31000,**changes) for v in ('baseline','head')]
+            self.assertIsNone(capacity.next_probe(rows,['baseline','head'],5000))
+
+    def test_baseline_downshift_stops_at_the_floor_without_repeating_rates(self):
+        rows=[probe(v,rate,scheduled_latency={'p99_ms':20})
+              for rate in (1000,2000) for v in ('baseline','head')]
+        self.assertIsNone(capacity.next_probe(rows,['baseline','head'],5000))
+
     def test_binary_refinement_stops_at_resolution_without_fixed_four_levels(self):
         peers=['baseline','head','peer_b']
         rows=[probe(v,rate) for rate in (45000,60000) for v in peers]

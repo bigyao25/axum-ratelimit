@@ -89,22 +89,44 @@ def _condition(row):
         return None
 
 
-def _qualified_confirmations(rows):
-    groups = defaultdict(list)
+def confirmation_coverage(rows, requested=(), backend=None):
+    """Separate execution from paired five-repeat qualification, without pooling hosts."""
+    groups=defaultdict(lambda:defaultdict(list))
     for row in rows:
-        if row.get('variant') != 'head' or row.get('campaign_stage', 'confirm') != 'confirm':
-            continue
-        condition = _condition(row)
-        if condition and row.get('target_rps') is not None:
-            groups[condition + (row['target_rps'],)].append(row)
-    qualified = defaultdict(list)
-    for (*condition, rate), items in groups.items():
-        if (len(items) >= 5 and len({row.get('repeat') for row in items}) == len(items)
-            and all(row.get('measurement_seconds', 0) >= 30
-                    and not row.get('invalid_reasons')
-                    and not row.get('load_failure_reasons') for row in items)):
-            qualified[tuple(condition)].append(rate)
-    return {condition: max(rates) for condition, rates in qualified.items()}
+        condition=_condition(row)
+        if (condition and row.get('variant') in CORE
+                and row.get('campaign_stage','confirm')=='confirm'):
+            key=(condition,row.get('target_rps'))+tuple(row.get(k) for k in
+                 ('platform_id','resource_layout_id','http_version','resource_profile',
+                  'server_cpu_limit','loadgen_cpu_limit','measurement_seconds','warmup_seconds',
+                  'quota','window_seconds'))
+            groups[key][row['variant']].append(row)
+    expected={(backend,case['clients'],case['mode']) for case in requested} if backend else set()
+    if not expected:
+        expected={_condition(row) for row in rows if _condition(row) and row.get('variant')=='head'}
+    levels=[];executed=set();qualified=set()
+    for key,variants in sorted(groups.items(),key=lambda item:str(item[0])):
+        condition,rate=key[:2]
+        counts={};complete=True
+        for variant in ('baseline','head'):
+            items=variants[variant]
+            full=(len(items)==5 and {r.get('repeat') for r in items}==set(range(5))
+                  and all(r.get('measurement_seconds',0)>=30 for r in items))
+            complete &= full
+            passed=sum(r.get('measurement_seconds',0)>=30 and not r.get('invalid_reasons')
+                       and not r.get('load_failure_reasons') for r in items)
+            counts[variant]=dict(rounds=len(items),passing=passed,complete=full)
+        paired_pass=complete and all(counts[v]['passing']==5 for v in CORE)
+        if complete: executed.add(condition)
+        if paired_pass: qualified.add(condition)
+        levels.append(dict(backend=condition[0],clients=condition[1],mode=condition[2],
+                           rate=rate,platform_id=key[2],executed=complete,qualified=paired_pass,
+                           counts=counts))
+    return dict(requested_cases=len(expected),executed_cases=len(expected & executed),
+                qualified_cases=len(expected & qualified),
+                complete=bool(expected) and expected<=qualified,
+                unqualified_cases=[dict(backend=b,clients=c,mode=m) for b,c,m in
+                                   sorted(expected-qualified)],levels=levels)
 
 
 def _hotspot(rows):
@@ -143,9 +165,16 @@ def _cost_claim(row):
 
 
 def concise(rows, verdict, status='unknown', issues=(), artifact_url='',
-            recoveries=(), unresolved=()):
+            recoveries=(), unresolved=(), requested=(), backend=None, scope='matrix'):
     """Short, conservative Markdown; full round-level evidence stays in artifacts."""
     lines = ['### Key findings', '']
+    if scope=='targeted':
+        lines += ['**Scope: targeted follow-up only.** Other matrix cells were not rerun; prior runs are not pooled.','']
+    coverage=confirmation_coverage(rows,requested,backend)
+    if coverage['requested_cases']:
+        n=coverage['requested_cases']
+        lines += [f"**Confirmation coverage:** {coverage['executed_cases']}/{n} requested scenarios executed with five long paired repeats; "
+                  f"**{coverage['qualified_cases']}/{n} qualified**. Execution success does not mean all scenarios qualified.",'']
     if not rows:
         lines += ['**No benchmark measurements available.** No performance claim can be made.']
         if unresolved:
@@ -165,7 +194,11 @@ def concise(rows, verdict, status='unknown', issues=(), artifact_url='',
         row = critical[0]
         lines.append(f"**Blocking issue:** {row.get('variant')} / {row.get('scenario')}: {', '.join(row['invalid_reasons'])}.")
         lines.append('')
-    qualified = _qualified_confirmations(rows)
+    qualified = {}
+    for level in coverage['levels']:
+        if level['qualified']:
+            key=(level['backend'],level['clients'],level['mode'])
+            qualified[key]=max(qualified.get(key,0),level['rate'])
     if qualified:
         lines += ['**HEAD sustained-load evidence** (each: at least 5 clean repeats, >=30 s):', '']
         top = [(100, 'allow'), (10000, 'allow'), (100, 'mixed'), (100, 'reject')]
@@ -177,6 +210,18 @@ def concise(rows, verdict, status='unknown', issues=(), artifact_url='',
     else:
         lines.append('**No five-repeat HEAD sustained-load level is confirmed** in this report.')
     lines.append('')
+    if coverage['levels']:
+        lines += ['| Backend / clients / mode | Offered RPS | HEAD passing / recorded | Baseline passing / recorded | Confirmation |',
+                  '| --- | ---: | ---: | ---: | --- |']
+        for level in coverage['levels']:
+            h,b=level['counts']['head'],level['counts']['baseline']
+            state='qualified' if level['qualified'] else 'not qualified' if level['executed'] else 'incomplete / short'
+            lines.append(f"| {level['backend']} / {level['clients']:,} / {level['mode']} | {level['rate']:,} | "
+                         f"{h['passing']}/{h['rounds']} | {b['passing']}/{b['rounds']} | {state} |")
+        lines.append('')
+    if coverage['unqualified_cases']:
+        names=[f"{c['backend']}/{c['clients']:,}/{c['mode']}" for c in coverage['unqualified_cases']]
+        lines += ['**Scenarios without a qualified level:** '+', '.join(names)+'.','']
     strengths = [c for c in verdict.get('costs', []) if c.get('winner') == 'head'
                  and c.get('ratio', 0) > 1 and c.get('response_mix_matched')]
     weaknesses = [c for c in verdict.get('costs', []) if c.get('winner') == c.get('competitor')
@@ -212,8 +257,8 @@ def concise(rows, verdict, status='unknown', issues=(), artifact_url='',
     if issues:
         lines.append(f'**Coverage warnings:** {len(issues)} issue(s); see campaign-plan.json for affected variants.')
         lines.append('')
-    lines += ['**Interpretation:** HEAD uses an exact sliding request log; fixed-window and'
-              ' bucketed-counter peers provide different boundary guarantees and may use fewer'
+    lines += ['**Interpretation:** HEAD uses an exact sliding request log; GCRA and'
+              ' token-bucket peers provide different boundary guarantees and may use fewer'
               ' resources. A lower CPU/memory reading does not establish equivalent correctness.',
               'Results are fixed-offered-load evidence, **not maximum throughput**. Backend'
               ' shards run on separate hosts; no cross-host ranking. Paired intervals are'

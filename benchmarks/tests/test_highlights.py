@@ -70,13 +70,37 @@ class ClassificationTests(unittest.TestCase):
 
 class ExecutiveSummaryTests(unittest.TestCase):
     def test_qualified_claim_requires_five_clean_30s_repeats(self):
-        rows=[row('head',repeat=i,scenario='memory/100/512/allow/12000rps',
-                  target_rps=12000) for i in range(5)]
+        rows=[row(v,repeat=i,scenario='memory/100/512/allow/12000rps',
+                  target_rps=12000) for i in range(5) for v in ('baseline','head')]
         content=highlights.concise(rows,{},'completed')
         self.assertIn('12,000 offered RPS',content)
-        self.assertLess(len(content.splitlines()),20)
+        self.assertLess(len(content.splitlines()),35)
         rows[0]['load_failure_reasons']=['in-flight limit reached']
         self.assertNotIn('12,000 offered RPS qualified',highlights.concise(rows,{},'completed'))
+
+    def test_four_of_five_is_explicit_and_execution_is_separate_from_qualification(self):
+        rows=[row(v,repeat=i,scenario='redis/10000/512/mixed/18000rps',target_rps=18000)
+              for i in range(5) for v in ('baseline','head')]
+        rows[-1]['load_failure_reasons']=['in-flight limit reached']
+        coverage=highlights.confirmation_coverage(rows,[dict(clients=10000,mode='mixed')],'redis')
+        self.assertEqual((coverage['executed_cases'],coverage['qualified_cases']),(1,0))
+        content=highlights.concise(rows,{},'completed')
+        self.assertIn('4/5 | 5/5 | not qualified',content)
+        self.assertIn('redis/10,000/mixed',content)
+
+    def test_missing_cases_and_targeted_scope_are_visible(self):
+        cases=[dict(clients=1,mode='allow'),dict(clients=10000,mode='mixed')]
+        content=highlights.concise([],{},'failure',requested=cases,backend='redis',scope='targeted')
+        self.assertIn('0/2 requested scenarios',content)
+        self.assertIn('targeted follow-up only',content)
+
+    def test_controls_hosts_and_repeat_identity_cannot_be_mixed_to_qualify(self):
+        for changes in ({'platform_id':'different'}, {'repeat':0}, {'measurement_seconds':5}):
+            rows=[row(v,repeat=i) for i in range(5) for v in ('baseline','head')]
+            rows[-1].update(changes)
+            self.assertFalse(highlights.confirmation_coverage(rows)['complete'])
+        rows=[row('head',repeat=i) for i in range(5)]
+        self.assertFalse(highlights.confirmation_coverage(rows)['complete'])
 
     def test_peer_warning_not_presented_as_peer_code_defect(self):
         rows=[row('baseline'),row('head'),
