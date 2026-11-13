@@ -92,7 +92,8 @@ def aggregate(root, suite, backends='both'):
     status=('Incomplete — inspect failing shard' if not success else
             'Inconclusive — one or more runner-limited shards' if incomplete_evidence else
             'Complete with warnings' if any(x['verification'] in ('completed_with_environment_limits','completed_with_peer_exclusions')
-                                          or (x['confirmation_coverage']['requested_cases'] and not x['confirmation_coverage']['complete']) for x in shards)
+                                          or (x['confirmation_coverage']['requested_cases'] and not x['confirmation_coverage']['complete'])
+                                          or x['confirmation_coverage']['requested_rates_complete'] is False for x in shards)
             else 'Complete')
     lines=['# Benchmark results','',f'**Run status:** {status}.',
            'Measurements from different hosted runners are **not combined or ranked**.',
@@ -100,6 +101,7 @@ def aggregate(root, suite, backends='both'):
            '']+sections
     return dict(suite=suite,complete=success,
                 qualification_complete=all(x['confirmation_coverage']['complete'] for x in shards),
+                requested_rates_complete=all(x['confirmation_coverage']['requested_rates_complete'] is not False for x in shards),
                 shards=shards), '\n'.join(lines)+'\n'
 
 def main():

@@ -95,7 +95,9 @@ python3 benchmarks/campaign.py --backend redis --targets 1:allow:20000 10000:mix
 
 The overview separates execution from qualification: every requested scenario
 has a paired confirmation table, including passing/recorded repeat counts for
-HEAD and baseline, unqualified levels and missing cases. `qualification.json`
+HEAD and baseline, unqualified levels and missing cases. Explicit requested rates
+are qualified separately from lower fallback rates: a scenario can have a clean
+lower-rate confirmation while its original offered load remains unconfirmed. `qualification.json`
 contains the same evidence in machine-readable form. Five clean paired repeats
 of at least 30 seconds qualify a level; four passing repeats do not. A successful
 workflow can therefore finish with qualification warnings. Earlier failed
