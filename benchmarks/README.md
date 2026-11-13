@@ -101,6 +101,12 @@ of at least 30 seconds qualify a level; four passing repeats do not. A successfu
 workflow can therefore finish with qualification warnings. Earlier failed
 attempts stay in their original artifacts and are never merged into a new run.
 
+Set `report_run` to an existing run ID to regenerate its overview without
+starting any benchmark containers. Select the original backend scope. Reports
+retain the original measurement commit and raw data, and record the new report
+generator commit separately. This is useful when a report bug is fixed after a
+long campaign. Report-only runs do not cancel active measurement runs.
+
 ## Resource isolation and request accounting
 
 Native Rust generator: **2 CPUs / 512 MiB**, server: **1 CPU / 1 GiB**, Redis:

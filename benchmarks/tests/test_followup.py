@@ -69,6 +69,11 @@ class FollowupTest(unittest.TestCase):
             self.assertTrue(index['qualification_complete'])
             self.assertEqual(len(index['shards']),1)
             self.assertIn('targeted follow-up only',content)
+            # v8 extracts a single artifact directly to the download root.
+            flat,_=workflow.aggregate(folder,'compare','redis')
+            self.assertTrue(flat['complete'])
+            self.assertTrue(flat['qualification_complete'])
+            self.assertFalse(workflow.aggregate(folder,'compare','memory')[0]['complete'])
 
     def test_target_selection_is_validated_and_single_backend_aggregation_is_explicit(self):
         for values in (['1:allow:0'],['2:allow:1000'],['1:deny:1000'],['oops'],
@@ -77,6 +82,14 @@ class FollowupTest(unittest.TestCase):
         self.assertEqual(workflow.matrix('compare','memory')['include'],[dict(shard='memory',backends='memory')])
         for suite,backend in [('compare','both'),('smoke','redis'),('micro','redis')]:
             with self.assertRaises(ValueError): workflow.matrix(suite,backend,['1:allow:20000'])
+
+    def test_report_only_selection_validates_source_and_does_not_start_benchmarks(self):
+        self.assertEqual(workflow.matrix('compare','redis',report_run='43371727041')['include'],
+                         [dict(shard='redis',backends='redis')])
+        for source in ('0','-1','oops','１２３'):
+            with self.assertRaises(ValueError): workflow.matrix('compare','redis',report_run=source)
+        with self.assertRaises(ValueError): workflow.matrix('smoke','redis',report_run='123')
+        with self.assertRaises(ValueError): workflow.matrix('compare','redis',['1:allow:20000'],'123')
 
 
 if __name__=='__main__': unittest.main()

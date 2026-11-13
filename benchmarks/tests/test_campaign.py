@@ -196,7 +196,7 @@ class WorkflowTest(unittest.TestCase):
                 (folder/'status.json').write_text(json.dumps({'outcome':'success'}))
                 (folder/'environment.json').write_text(json.dumps({'git_sha':'sha'}))
                 (folder/'raw.json').write_text(json.dumps({'rounds':[] if name=='memory' else
-                    [row('head',platform_id='redis-host')]}))
+                    [row('head',platform_id='redis-host',scenario='redis/1/512/allow/10000rps')]}))
                 (folder/'verdicts.json').write_text(json.dumps({'capacity':[],'costs':[],'boundaries':[]}))
                 (folder/'assessment.md').write_text('# Benchmark assessment')
                 (folder/'result-classification.json').write_text(json.dumps({

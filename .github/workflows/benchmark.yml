@@ -24,10 +24,16 @@ on:
         required: false
         default: ''
         type: string
+      report_run:
+        description: 'Optional existing run ID: rebuild its reports without generating load'
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
+  actions: read
 concurrency:
-  group: benchmark-${{ github.workflow }}-${{ github.ref }}-${{ inputs.backends }}
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}-${{ inputs.backends }}-${{ inputs.report_run && 'report' || 'benchmark' }}
   cancel-in-progress: true
 jobs:
   prepare:
@@ -47,11 +53,12 @@ jobs:
           BENCHMARK_SUITE: ${{ inputs.suite }}
           BENCHMARK_SELECTION: ${{ inputs.backends }}
           BENCHMARK_TARGETS: ${{ inputs.targets }}
+          BENCHMARK_REPORT_RUN: ${{ inputs.report_run }}
         run: |
           read -r -a targets <<< "$BENCHMARK_TARGETS"
-          python3 benchmarks/workflow.py plan --suite "$BENCHMARK_SUITE" --backends "$BENCHMARK_SELECTION" --targets "${targets[@]}" --github-output
+          python3 benchmarks/workflow.py plan --suite "$BENCHMARK_SUITE" --backends "$BENCHMARK_SELECTION" --targets "${targets[@]}" --report-run "$BENCHMARK_REPORT_RUN" --github-output
   benchmark:
-    if: inputs.suite != 'micro'
+    if: inputs.suite != 'micro' && !inputs.report_run
     name: Benchmark (${{ matrix.shard }})
     needs: prepare
     runs-on: ubuntu-latest
@@ -154,12 +161,15 @@ jobs:
           pattern: benchmark-diagnostics-*
           path: benchmarks/results/shards
           merge-multiple: false
+          run-id: ${{ inputs.report_run || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Index independent measurements
         if: always()
         env:
           BENCHMARK_SUITE: ${{ inputs.suite }}
           BENCHMARK_SELECTION: ${{ inputs.backends }}
-        run: python3 benchmarks/workflow.py aggregate benchmarks/results/shards --suite "$BENCHMARK_SUITE" --backends "$BENCHMARK_SELECTION" --output benchmarks/results/overview --github-summary
+          BENCHMARK_REPORT_RUN: ${{ inputs.report_run }}
+        run: python3 benchmarks/workflow.py aggregate benchmarks/results/shards --suite "$BENCHMARK_SUITE" --backends "$BENCHMARK_SELECTION" --measurement-run "$BENCHMARK_REPORT_RUN" --output benchmarks/results/overview --github-summary
       - name: Upload workflow overview
         if: always()
         uses: actions/upload-artifact@v7
