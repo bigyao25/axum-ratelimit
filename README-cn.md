@@ -21,11 +21,9 @@
 
 ## 快速开始
 
-首次发布到 crates.io 之前，通过本地源码依赖接入，路径按实际位置调整：
-
 ```toml
 [dependencies]
-axum-ratelimit = { path = "../axum-ratelimit" }
+axum-ratelimit = "0.1"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 ```
@@ -34,10 +32,8 @@ Redis 支持默认启用。仅使用内存存储时，可关闭默认特性：
 
 ```toml
 [dependencies]
-axum-ratelimit = { path = "../axum-ratelimit", default-features = false }
+axum-ratelimit = { version = "0.1", default-features = false }
 ```
-
-`0.1.0` 发布后，可以将路径依赖替换为 `axum-ratelimit = "0.1"`。
 
 ## 使用方法
 
@@ -155,7 +151,7 @@ RateLimit: "api";r=0
 
 ```toml
 [dependencies]
-axum-ratelimit = { path = "../axum-ratelimit", default-features = false, features = ["redis"] }
+axum-ratelimit = { version = "0.1", default-features = false, features = ["redis"] }
 ```
 
 在开始处理请求前创建一次 Store，并传入 `RateLimitLayer::new`：

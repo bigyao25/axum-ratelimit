@@ -21,11 +21,9 @@ Requires Rust 1.89 or newer.
 
 ## Quick Start
 
-Until the first crates.io release, add the source checkout as a local dependency. Adjust the path to its location:
-
 ```toml
 [dependencies]
-axum-ratelimit = { path = "../axum-ratelimit" }
+axum-ratelimit = "0.1"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 ```
@@ -34,10 +32,8 @@ Redis support is enabled by default. For a memory-only build, disable default fe
 
 ```toml
 [dependencies]
-axum-ratelimit = { path = "../axum-ratelimit", default-features = false }
+axum-ratelimit = { version = "0.1", default-features = false }
 ```
-
-Once version `0.1.0` is published, the path dependency can be replaced with `axum-ratelimit = "0.1"`.
 
 ## Usage
 
@@ -155,7 +151,7 @@ The `redis` feature is enabled by default. With default features disabled, enabl
 
 ```toml
 [dependencies]
-axum-ratelimit = { path = "../axum-ratelimit", default-features = false, features = ["redis"] }
+axum-ratelimit = { version = "0.1", default-features = false, features = ["redis"] }
 ```
 
 Create the store once before serving requests and pass it to `RateLimitLayer::new`:
