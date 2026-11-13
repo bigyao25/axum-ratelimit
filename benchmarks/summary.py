@@ -45,6 +45,9 @@ def assess(round_):
 
 
 def render(folder, status='unknown', artifact_url=''):
+    if (folder/'diagnosis.json').exists():
+        import diagnose
+        return diagnose.markdown(json.loads((folder/'diagnosis.json').read_text()),resolve_status(folder,status),artifact_url)
     status=resolve_status(folder,status)
     raw_path=folder/'raw.json'
     env_path=folder/'environment.json'
@@ -64,7 +67,7 @@ def render(folder, status='unknown', artifact_url=''):
                                  plan.get('environment_unresolved', []),
                                  plan.get('requested_cases', []),plan.get('backend'),
                                  plan.get('scope','matrix'))
-    lines=['# Benchmark assessment','',executive,'','---','',
+    lines=['# Benchmark assessment','',executive,comparison.scorecard_markdown(rows),'','---','',
            '## Detailed evidence','',f'Execution status: **{esc(status)}**.',
            f'Completed rounds: **{len(rows)}**; measurement-clean: **{len(valid)}**; other invalid: **{len(unexpected)}**.','']
     quality='no data' if not rows else 'failed' if not valid else 'partial' if unexpected else 'clean'

@@ -95,7 +95,9 @@ python3 benchmarks/campaign.py --backend redis --targets 1:allow:20000 10000:mix
 
 The overview separates execution from qualification: every requested scenario
 has a paired confirmation table, including passing/recorded repeat counts for
-HEAD and baseline, unqualified levels and missing cases. `qualification.json`
+HEAD and baseline, unqualified levels and missing cases. Explicit requested rates
+are qualified separately from lower fallback rates: a scenario can have a clean
+lower-rate confirmation while its original offered load remains unconfirmed. `qualification.json`
 contains the same evidence in machine-readable form. Five clean paired repeats
 of at least 30 seconds qualify a level; four passing repeats do not. A successful
 workflow can therefore finish with qualification warnings. Earlier failed
@@ -106,6 +108,50 @@ starting any benchmark containers. Select the original backend scope. Reports
 retain the original measurement commit and raw data, and record the new report
 generator commit separately. This is useful when a report bug is fixed after a
 long campaign. Report-only runs do not cancel active measurement runs.
+
+## Queue diagnostics and client method
+
+The shared benchmark server explicitly enables TCP_NODELAY for every accepted
+socket and every product. Axum 0.8.9 leaves this socket option at the OS default;
+Nagle plus delayed ACK can add transport latency outside the limiter/handler.
+CLI `--server-nagle` retains the former setting for the same-host A/B experiment.
+This is server harness configuration, not a change to the rate-limiting crate.
+[Axum listener configuration](https://docs.rs/axum/0.8.9/axum/serve/trait.ListenerExt.html)
+
+
+Select `suite=diagnose` and either or both backends to run controlled single-client
+allow experiments at 35k Memory / 20k Redis RPS. The same runner and images run
+baseline and HEAD with four profiles: legacy drop/cold pool, drop/warm pool, bounded
+admission/warm pool, and the same client with server TCP_NODELAY enabled.
+Profile and product order reverse across repeat blocks. Each uses three 30-second repetitions and 2-second
+warmup. Diagnostic response headers and runtime probes are enabled for all peers
+in this suite, so these measurements are separate from formal uninstrumented
+performance comparisons. `diagnosis.json` and the overview summarize each profile.
+
+The measurement arrival epoch starts after histogram/counter setup (recorded as
+`setup_ms`), so allocation work does not create a fictitious initial backlog.
+The native generator now reuses HTTP connections from warmup while preserving
+separate client identities and per-phase counters. One pending admission can wait
+for a concurrency slot until 100 ms after its original scheduled arrival. Due
+times and total intended arrivals never change: waiting contributes to scheduled
+latency, expiry remains a dropped request, and sustained overload still fails the
+existing latency/completion/no-drop gates. The 512-slot ceiling is unchanged;
+written requests are never replayed. CLI `--admission-policy drop` and `--cold-pool`
+retain the former behavior for controlled experiments.
+
+New histograms expose p99.9, p99.99 and exact maximum as well as p99. Bounded slow
+request examples and drop events locate admission, executor, connection-pool,
+connect, response and server-service delays. Diagnostic-only wakeup probes help
+separate runtime scheduling from handler/middleware/Redis waits. Host CPU/pressure
+snapshots and container throttling counters remain supporting evidence, not proof
+of a specific cause. Historical and new admission/pool/instrumentation profiles
+are never pooled into one comparison.
+
+Product scorecards show every recorded repeat, achieved RPS, request p99, server
+CPU and response mix at a common offered load. CPU/HEAD ratios require qualified
+matched workloads; the separate paired intervals retain statistical/noise gates.
+The scorecard provides readable observations even when no statistical winner is
+established. Failed repeats and semantically different mixes remain visible.
 
 ## Resource isolation and request accounting
 

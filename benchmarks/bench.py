@@ -35,6 +35,11 @@ def cgroup(container):
     script = 'cat /sys/fs/cgroup/cpu.stat; echo MEMORY; cat /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak; echo EVENTS; cat /sys/fs/cgroup/memory.events; echo RSS; cat /sys/fs/cgroup/memory.stat; echo SOCKETS; cat /proc/net/sockstat; echo PROCESS; cat /proc/1/status'
     return docker('exec', container, 'sh','-c',script)
 
+def host_snapshot():
+    """Unprivileged host signals; endpoint deltas do not locate individual pauses."""
+    return {name:Path(path).read_text() if Path(path).exists() else None for name,path in
+            [('cpu_stat','/proc/stat'),('cpu_pressure','/proc/pressure/cpu')]}
+
 def counters(raw):
     return {line.split()[0]: int(line.split()[1]) for line in raw.splitlines() if len(line.split())==2 and line.split()[1].isdigit()}
 
@@ -123,6 +128,10 @@ def main():
     p.add_argument('--warmup', type=int, default=None)
     p.add_argument('--repeats', type=int, default=None)
     p.add_argument('--allow-dirty', action='store_true')
+    p.add_argument('--admission-policy',choices=['wait','drop'],default='wait')
+    p.add_argument('--cold-pool',action='store_true',help='Diagnostic legacy behavior: discard the warmup pool')
+    p.add_argument('--diagnostics',action='store_true',help='Instrument server service time and runtime wakeup; separate from uninstrumented comparisons')
+    p.add_argument('--server-nagle',action='store_true',help='Diagnostic legacy server TCP_NODELAY=false')
     p.add_argument('--skip-build', action='store_true')
     p.add_argument('--reuse-build-manifest',type=str,help='Reuse images only after verifying recorded source, build settings and image IDs')
     p.add_argument('--output', type=Path, default=HERE/'results'/time.strftime('%Y%m%d-%H%M%S'))
@@ -274,6 +283,9 @@ def main():
     env=os.environ.copy()
     env['LOADGEN_IMAGE']=generator_image
     env['PHASE_BARRIER']='1' if compare else '0'
+    env.update(ADMISSION_POLICY=a.admission_policy,REUSE_WARMUP_POOL='0' if a.cold_pool else '1',
+               DIAGNOSTICS='1' if a.diagnostics else '0',REDIS_SLOWLOG_THRESHOLD='1000' if a.diagnostics else '10000',
+               SERVER_NODELAY='0' if a.server_nagle else '1')
     for key in ('server_cpus','loadgen_cpus','redis_cpus','workers','server_cpuset','loadgen_cpuset','redis_cpuset'):
         env.setdefault(key.upper(),str(resource[key]))
     # CPU quotas are authoritative for the selected layout.
@@ -324,8 +336,12 @@ def main():
                             process=None
                             try:
                                 process=subprocess.Popen(compose+['run','--no-deps','--name',project+'-loadgen','-T','loadgen'],env=env,stdout=subprocess.PIPE,stdin=subprocess.PIPE if compare else subprocess.DEVNULL,text=True)
+                                host=[]
+                                def capture():
+                                    host.append(host_snapshot())
+                                    return {s:cgroup(cid) for s,cid in ids.items()}
                                 if compare:
-                                    result,before,after,diagnostic_seconds=controlled_measurement(process,lambda:{s:cgroup(cid) for s,cid in ids.items()})
+                                    result,before,after,diagnostic_seconds=controlled_measurement(process,capture)
                                 else:
                                     output=process.communicate()[0]
                                 if process.returncode: raise RuntimeError('Load generator failed')
@@ -350,6 +366,7 @@ def main():
                         if states['loadgen']['HostConfig']['Memory']!=512*1024**2 or states['loadgen']['HostConfig']['NanoCpus']!=resource['loadgen_cpus']*10**9:
                             raise RuntimeError('Load generator limits not applied')
                         redis_info=dc('exec','-T','redis','redis-cli','INFO','ALL')
+                        redis_slowlog=json.loads(dc('exec','-T','redis','redis-cli','--json','SLOWLOG','GET','32')) if a.diagnostics else []
                         rc=dict(line.split(':',1) for line in redis_info.splitlines() if ':' in line and not line.startswith('#'))
                         cpu={s:{k:counters(after[s]).get(k,0)-counters(before[s]).get(k,0) for k in ('usage_usec','throttled_usec','nr_periods','nr_throttled')} for s in before}
                         if not compare: diagnostic_seconds=time.monotonic()-diagnostic_start
@@ -360,6 +377,8 @@ def main():
                         result.update(loadgen_cpu_limit=resource['loadgen_cpus'],loadgen_cpu_pct=lg_cpu['usage_usec']/max(result['elapsed_seconds'],.001)/10000,
                                       loadgen_throttled_usec=lg_cpu['throttled_usec'],
                                       warmup_seconds=a.warmup, resource_interval_seconds=diagnostic_seconds,
+                                      instrumented=a.diagnostics,
+                                      server_nodelay=not a.server_nagle,
                                       resource_phase='measurement' if compare else 'warmup-and-measurement',
                                       resource_capture_skew_seconds=max(0,diagnostic_seconds-result['elapsed_seconds']) if compare else None,
                                       resource_profile=a.resources, server_cpu_limit=resource['server_cpus'],
@@ -380,7 +399,7 @@ def main():
                                       algorithm=variants.VARIANTS[v]['algorithm'], workload='comparison' if compare else 'cost',
                                       equivalence_group='exact-log' if v=='head' else v,
                                       correctness='first-window burst oracle' if variants.VARIANTS[v]['oracle'] else 'non-equivalent policy; observations only',
-                                      diagnostics=dict(before=before,after=after,cpu=cpu,samples=samples,redis=rc,containers=states))
+                                      diagnostics=dict(before=before,after=after,cpu=cpu,samples=samples,redis=rc,redis_slowlog=redis_slowlog,containers=states,host=host))
                         print(round_diagnostic(result,a.rate),flush=True)
                         if generator_pressure(result):
                             print('  !! load generator pressure: late drops or CPU near quota; this round cannot qualify a rate',flush=True)

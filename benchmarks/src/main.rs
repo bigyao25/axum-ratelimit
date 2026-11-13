@@ -1,5 +1,5 @@
 //! Benchmark-only Axum server with controlled identities and shared HTTP behavior.
-use axum::{Router, middleware, response::IntoResponse, routing::get};
+use axum::{Router, middleware, response::IntoResponse, routing::get, serve::ListenerExt};
 use axum_ratelimit::{
     RateLimitConfig, RateLimitLayer,
     store::{FailurePolicy, MemoryStore, RedisStore, RedisStoreOptions},
@@ -82,6 +82,17 @@ fn number(name: &str, default: usize) -> Result<usize, Box<dyn std::error::Error
     }
 }
 
+fn configure_listener(
+    listener: tokio::net::TcpListener,
+    nodelay: bool,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = std::net::SocketAddr> {
+    listener.tap_io(move |stream| {
+        stream
+            .set_nodelay(nodelay)
+            .expect("configure benchmark TCP_NODELAY")
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workers = number("WORKERS", 1)?;
     if workers == 0 {
@@ -105,7 +116,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .window_secs(window as u64);
     config.validate()?;
     let routes = Router::new().route("/", get(|| async { "ok" }));
-    let app = match (variant.as_str(), backend.as_str()) {
+    let mut app = match (variant.as_str(), backend.as_str()) {
         ("baseline", "memory" | "redis") => routes,
         ("head", "memory") => routes.layer(
             RateLimitLayer::new(config, MemoryStore::new())
@@ -162,8 +173,44 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => return Err("unsupported variant/backend combination".into()),
     };
+    if env::var("DIAGNOSTICS").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let wakeup = Arc::new(AtomicU64::new(0));
+        let monitored = wakeup.clone();
+        tokio::spawn(async move {
+            loop {
+                let due = tokio::time::Instant::now() + Duration::from_millis(5);
+                tokio::time::sleep_until(due).await;
+                monitored.store(
+                    tokio::time::Instant::now()
+                        .saturating_duration_since(due)
+                        .as_micros() as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        app = app.layer(middleware::from_fn(
+            move |request: axum::extract::Request, next: middleware::Next| {
+                let wakeup = wakeup.clone();
+                async move {
+                    let start = std::time::Instant::now();
+                    let mut response = next.run(request).await;
+                    response.headers_mut().insert(
+                        "x-bench-service-us",
+                        start.elapsed().as_micros().to_string().parse().unwrap(),
+                    );
+                    response.headers_mut().insert(
+                        "x-bench-runtime-us",
+                        wakeup.load(Ordering::Relaxed).to_string().parse().unwrap(),
+                    );
+                    response
+                }
+            },
+        ));
+    }
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     eprintln!("variant={variant} backend={backend} limit={quota} window={window}");
+    let listener = configure_listener(listener, env::var("SERVER_NODELAY").as_deref() != Ok("0"));
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -171,6 +218,20 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn accepted_sockets_use_the_requested_nodelay_policy() {
+        use axum::serve::Listener;
+        for enabled in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut listener = configure_listener(listener, enabled);
+            let client = tokio::spawn(tokio::net::TcpStream::connect(address));
+            let (stream, _) = listener.accept().await;
+            assert_eq!(stream.nodelay().unwrap(), enabled);
+            drop(client.await.unwrap().unwrap());
+            drop(stream);
+        }
+    }
 
     #[test]
     fn token_bucket_adapter_preserves_burst_and_identity_isolation() {

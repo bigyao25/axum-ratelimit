@@ -100,6 +100,7 @@ def confirmation_coverage(rows, requested=(), backend=None):
                  ('platform_id','resource_layout_id','http_version','resource_profile',
                   'server_cpu_limit','loadgen_cpu_limit','measurement_seconds','warmup_seconds',
                   'quota','window_seconds'))
+            key+=tuple(row.get(k) for k in ('admission_policy','reuse_warmup_pool','instrumented','server_nodelay'))
             groups[key][row['variant']].append(row)
     expected={(backend,case['clients'],case['mode']) for case in requested} if backend else set()
     if not expected:
@@ -122,8 +123,18 @@ def confirmation_coverage(rows, requested=(), backend=None):
         levels.append(dict(backend=condition[0],clients=condition[1],mode=condition[2],
                            rate=rate,platform_id=key[2],executed=complete,qualified=paired_pass,
                            counts=counts))
+    requested_levels=[]
+    if backend:
+        for case in requested:
+            if 'rate' not in case:continue
+            condition=(backend,case['clients'],case['mode'])
+            confirmed=[r['rate'] for r in levels if (r['backend'],r['clients'],r['mode'])==condition and r['qualified']]
+            requested_levels.append(dict(backend=backend,clients=case['clients'],mode=case['mode'],
+                requested_rate=case['rate'],qualified=case['rate'] in confirmed,confirmed_rates=sorted(set(confirmed))))
     return dict(requested_cases=len(expected),executed_cases=len(expected & executed),
                 qualified_cases=len(expected & qualified),
+                requested_levels=requested_levels,
+                requested_rates_complete=all(r['qualified'] for r in requested_levels) if requested_levels else None,
                 complete=bool(expected) and expected<=qualified,
                 unqualified_cases=[dict(backend=b,clients=c,mode=m) for b,c,m in
                                    sorted(expected-qualified)],levels=levels)
@@ -175,6 +186,14 @@ def concise(rows, verdict, status='unknown', issues=(), artifact_url='',
         n=coverage['requested_cases']
         lines += [f"**Confirmation coverage:** {coverage['executed_cases']}/{n} requested scenarios executed with five long paired repeats; "
                   f"**{coverage['qualified_cases']}/{n} qualified**. Execution success does not mean all scenarios qualified.",'']
+    if coverage['requested_levels']:
+        original=coverage['requested_levels']
+        lines += [f"**Originally requested offered rates:** {sum(r['qualified'] for r in original)}/{len(original)} qualified at the requested rate. Lower-rate confirmations do not qualify the original target.",'']
+        for target in original:
+            if target['qualified']:continue
+            confirmed=', '.join(_number(rate) for rate in target['confirmed_rates']) or 'none'
+            lines.append(f"- {target['backend']}/{target['clients']:,}/{target['mode']}: requested **{_number(target['requested_rate'])} RPS**; confirmed rates **{confirmed} RPS**. Requested rate remains unconfirmed.")
+        lines.append('')
     if not rows:
         lines += ['**No benchmark measurements available.** No performance claim can be made.']
         if unresolved:

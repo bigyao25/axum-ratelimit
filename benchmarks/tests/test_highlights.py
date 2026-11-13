@@ -69,6 +69,19 @@ class ClassificationTests(unittest.TestCase):
 
 
 class ExecutiveSummaryTests(unittest.TestCase):
+    def test_lower_rate_confirmation_does_not_qualify_the_requested_load(self):
+        rows=[row(v,repeat=i,scenario='memory/1/512/allow/17500rps',target_rps=17500)
+              for i in range(5) for v in ('baseline','head')]
+        targets=[dict(clients=1,mode='allow',rate=35000)]
+        coverage=highlights.confirmation_coverage(rows,targets,'memory')
+        self.assertTrue(coverage['complete'])
+        self.assertFalse(coverage['requested_rates_complete'])
+        content=highlights.concise(rows,{},'completed',requested=targets,backend='memory',scope='targeted')
+        self.assertIn('0/1 qualified at the requested rate',content)
+        self.assertIn('confirmed rates **17,500 RPS**',content)
+        targets[0]['rate']=17500
+        self.assertTrue(highlights.confirmation_coverage(rows,targets,'memory')['requested_rates_complete'])
+
     def test_qualified_claim_requires_five_clean_30s_repeats(self):
         rows=[row(v,repeat=i,scenario='memory/100/512/allow/12000rps',
                   target_rps=12000) for i in range(5) for v in ('baseline','head')]
