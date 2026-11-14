@@ -2,7 +2,11 @@
 
 An accurate, high-performance and easy-to-customize rate limiting middleware for **Axum 0.8**, with in-memory and Redis stores.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/axum-ratelimit.svg)](https://crates.io/crates/axum-ratelimit)
+[![Documentation](https://docs.rs/axum-ratelimit/badge.svg)](https://docs.rs/axum-ratelimit)
+[![CI](https://img.shields.io/github/actions/workflow/status/bigyao25/axum-ratelimit/CI.yml?branch=main)](https://github.com/bigyao25/axum-ratelimit/actions/workflows/CI.yml)
+[![Security](https://img.shields.io/github/actions/workflow/status/bigyao25/axum-ratelimit/security.yml?branch=main&label=security)](https://github.com/bigyao25/axum-ratelimit/actions/workflows/security.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 [中文文档](README-cn.md)
 
